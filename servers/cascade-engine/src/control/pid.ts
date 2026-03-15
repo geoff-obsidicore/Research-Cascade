@@ -84,8 +84,8 @@ export function updatePID(state: PIDState, error: number): PIDOutput {
   state.integral = clamp(state.integral + error, -state.integralMax, state.integralMax);
   const I = state.ki * state.integral;
 
-  // Derivative
-  state.derivative = error - state.prevError;
+  // Derivative (using previous call's error)
+  state.derivative = error - state.error;
   const D = state.kd * state.derivative;
 
   // Combined output, clamped 0-1

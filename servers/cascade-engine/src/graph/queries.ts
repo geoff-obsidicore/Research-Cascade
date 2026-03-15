@@ -138,14 +138,13 @@ function estimateGiantComponentFraction(db: any, totalNodes: number): number {
 
   if (!start) return 0;
 
-  // BFS via recursive CTE (bounded)
+  // BFS via recursive CTE — UNION deduplicates automatically (no self-reference needed)
   const reachable = db.prepare(`WITH RECURSIVE component(id) AS (
     SELECT ?
     UNION
-    SELECT CASE WHEN e.source_id = c.id THEN e.target_id ELSE e.source_id END
-    FROM component c
-    JOIN kg_edges e ON e.source_id = c.id OR e.target_id = c.id
-    WHERE CASE WHEN e.source_id = c.id THEN e.target_id ELSE e.source_id END NOT IN (SELECT id FROM component)
+    SELECT e.target_id FROM component c JOIN kg_edges e ON e.source_id = c.id
+    UNION
+    SELECT e.source_id FROM component c JOIN kg_edges e ON e.target_id = c.id
   )
   SELECT COUNT(*) as n FROM component`)
     .get(start.id) as any;
