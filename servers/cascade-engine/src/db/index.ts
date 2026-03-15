@@ -32,6 +32,11 @@ function getDefaultDbPath(): string {
   return join(dir, 'knowledge.db');
 }
 
+/** For testing only — inject an in-memory DB */
+export function __setTestDb(db: Database.Database | null): void {
+  _db = db;
+}
+
 export function getDb(options?: DatabaseOptions): Database.Database {
   if (_db) return _db;
 
