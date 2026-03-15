@@ -1,0 +1,20 @@
+[
+  {
+    "matcher": "SessionStart",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "bash scripts/session-context.sh"
+      }
+    ]
+  },
+  {
+    "matcher": "PreCompact",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "bash scripts/pre-compact-flush.sh"
+      }
+    ]
+  }
+]

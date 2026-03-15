@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cascade-engine": {
+      "command": "cmd",
+      "args": ["/c", "node", "servers/cascade-engine/dist/index.js"],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,667 @@
+#!/usr/bin/env node
+/**
+ * Research Cascade MCP Server
+ *
+ * Stdio-based MCP server providing 12+ tools for progressive research
+ * with knowledge graph, trust scoring, and self-regulation.
+ *
+ * NEVER console.log() — corrupts stdio JSON-RPC. Use console.error() only.
+ */
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { getDb, closeDb, generateId, contentHash, withTransaction } from './db/index.js';
+
+const server = new McpServer({
+  name: 'cascade-engine',
+  version: '0.1.0',
+});
+
+// ============================================================
+// TOOL 1: store_plan — Save immutable research plan
+// ============================================================
+server.tool(
+  'store_plan',
+  'Save an immutable research plan for a cascade. Locks questions and criteria at round start to prevent HARKing.',
+  {
+    cascade_id: z.string().describe('Cascade ID to attach the plan to'),
+    plan: z.object({
+      questions: z.array(z.string()).describe('Research questions to investigate'),
+      success_criteria: z.array(z.string()).describe('How we know when we have a good answer'),
+      scope_boundaries: z.array(z.string()).optional().describe('What is explicitly out of scope'),
+      max_rounds: z.number().optional().default(5),
+      token_budget: z.number().optional().default(500000),
+    }).describe('The research plan to lock in'),
+  },
+  async ({ cascade_id, plan }) => {
+    const db = getDb();
+
+    // Check if cascade exists
+    const existing = db.prepare('SELECT id, plan_json FROM cascades WHERE id = ?').get(cascade_id) as any;
+    if (existing?.plan_json) {
+      return { content: [{ type: 'text' as const, text: `Error: Plan already locked for cascade ${cascade_id}. Plans are immutable to prevent HARKing.` }] };
+    }
+
+    const planJson = JSON.stringify(plan);
+
+    if (existing) {
+      db.prepare('UPDATE cascades SET plan_json = ?, max_rounds = ?, token_budget = ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(planJson, plan.max_rounds, plan.token_budget, cascade_id);
+    } else {
+      db.prepare('INSERT INTO cascades (id, question, plan_json, max_rounds, token_budget) VALUES (?, ?, ?, ?, ?)')
+        .run(cascade_id, plan.questions[0] || 'Unnamed cascade', planJson, plan.max_rounds, plan.token_budget);
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Plan locked for cascade ${cascade_id}. ${plan.questions.length} questions, max ${plan.max_rounds} rounds, ${plan.token_budget} token budget.` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 2: store_finding — Ingest finding with trust scoring
+// ============================================================
+server.tool(
+  'store_finding',
+  'Store a research finding. Generates content-addressable ID. Trust scoring applied automatically.',
+  {
+    cascade_id: z.string(),
+    thread_id: z.string().optional(),
+    claim: z.string().describe('The factual claim or finding'),
+    evidence: z.string().optional().describe('Supporting evidence or context'),
+    source_url: z.string().optional(),
+    source_type: z.enum(['primary', 'secondary', 'tertiary']).optional(),
+    confidence: z.number().min(0).max(1).optional().default(0.5),
+    cascade_round: z.number(),
+  },
+  async ({ cascade_id, thread_id, claim, evidence, source_url, source_type, confidence, cascade_round }) => {
+    const db = getDb();
+    const id = contentHash(claim);
+
+    // Check for duplicate via content hash
+    const existing = db.prepare('SELECT id FROM findings WHERE id = ?').get(id) as any;
+    if (existing) {
+      // Idempotent upsert — update confidence if new evidence
+      db.prepare(`UPDATE findings SET
+        confidence = MAX(confidence, ?),
+        evidence = COALESCE(?, evidence),
+        updated_at = datetime('now')
+        WHERE id = ?`).run(confidence, evidence, id);
+      return { content: [{ type: 'text' as const, text: `Finding ${id} already exists — updated confidence.` }] };
+    }
+
+    db.prepare(`INSERT INTO findings (id, thread_id, cascade_id, claim, evidence, source_url, source_type, confidence, cascade_round)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, thread_id, cascade_id, claim, evidence, source_url, source_type, confidence, cascade_round);
+
+    // Auto-index in FTS (handled by trigger)
+
+    return {
+      content: [{ type: 'text' as const, text: `Finding stored: ${id} (confidence: ${confidence}, round: ${cascade_round})` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 3: get_findings — Query findings (FTS + filters)
+// ============================================================
+server.tool(
+  'get_findings',
+  'Query stored findings using full-text search and/or filters.',
+  {
+    cascade_id: z.string().optional(),
+    query: z.string().optional().describe('FTS search query'),
+    min_confidence: z.number().min(0).max(1).optional(),
+    include_quarantined: z.boolean().optional().default(false),
+    round: z.number().optional(),
+    limit: z.number().optional().default(20),
+  },
+  async ({ cascade_id, query, min_confidence, include_quarantined, round, limit }) => {
+    const db = getDb();
+    const params: any[] = [];
+    let sql: string;
+
+    if (query) {
+      sql = `SELECT f.id, f.claim, f.evidence, f.source_url, f.confidence, f.trust_composite,
+              f.grade_level, f.quarantined, f.cascade_round, f.created_at
+             FROM findings f
+             JOIN findings_fts fts ON f.rowid = fts.rowid
+             WHERE findings_fts MATCH ?`;
+      params.push(query);
+    } else {
+      sql = `SELECT id, claim, evidence, source_url, confidence, trust_composite,
+              grade_level, quarantined, cascade_round, created_at
+             FROM findings WHERE 1=1`;
+    }
+
+    if (cascade_id) { sql += ' AND cascade_id = ?'; params.push(cascade_id); }
+    if (min_confidence !== undefined) { sql += ' AND confidence >= ?'; params.push(min_confidence); }
+    if (!include_quarantined) { sql += ' AND quarantined = 0'; }
+    if (round !== undefined) { sql += ' AND cascade_round = ?'; params.push(round); }
+
+    sql += ' ORDER BY confidence DESC LIMIT ?';
+    params.push(limit);
+
+    const findings = db.prepare(sql).all(...params);
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(findings, null, 2) }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 4: add_entity — Add KG entity
+// ============================================================
+server.tool(
+  'add_entity',
+  'Add an entity to the knowledge graph. Upserts on (name, entity_type).',
+  {
+    name: z.string(),
+    entity_type: z.string().describe('e.g., concept, person, tool, technique, paper'),
+    properties: z.record(z.any()).optional().default({}),
+    tier: z.enum(['peripheral', 'working', 'core']).optional().default('working'),
+    importance: z.number().min(0).max(1).optional().default(0.5),
+  },
+  async ({ name, entity_type, properties, tier, importance }) => {
+    const db = getDb();
+    const propsJson = JSON.stringify(properties);
+
+    const result = db.prepare(`INSERT INTO kg_entities (name, entity_type, properties, tier, importance)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(name, entity_type) DO UPDATE SET
+        properties = json_patch(properties, ?),
+        importance = MAX(importance, ?),
+        last_accessed = datetime('now')`)
+      .run(name, entity_type, propsJson, tier, importance, propsJson, importance);
+
+    const entity = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
+      .get(name, entity_type) as any;
+
+    return {
+      content: [{ type: 'text' as const, text: `Entity ${entity.id}: "${name}" (${entity_type}, tier: ${tier})` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 5: add_link — Add KG edge
+// ============================================================
+server.tool(
+  'add_link',
+  'Add a directional link between two knowledge graph entities.',
+  {
+    source_name: z.string(),
+    source_type: z.string(),
+    target_name: z.string(),
+    target_type: z.string(),
+    relation_type: z.string().describe('e.g., relates_to, causes, contradicts, supports, uses, part_of'),
+    weight: z.number().min(0).max(1).optional().default(1.0),
+    properties: z.record(z.any()).optional().default({}),
+  },
+  async ({ source_name, source_type, target_name, target_type, relation_type, weight, properties }) => {
+    const db = getDb();
+
+    const source = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
+      .get(source_name, source_type) as any;
+    const target = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
+      .get(target_name, target_type) as any;
+
+    if (!source) return { content: [{ type: 'text' as const, text: `Error: Source entity "${source_name}" (${source_type}) not found. Add it first.` }] };
+    if (!target) return { content: [{ type: 'text' as const, text: `Error: Target entity "${target_name}" (${target_type}) not found. Add it first.` }] };
+
+    db.prepare(`INSERT INTO kg_edges (source_id, target_id, relation_type, weight, properties)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(source_id, target_id, relation_type) DO UPDATE SET
+        weight = MAX(weight, ?),
+        activation_count = activation_count + 1,
+        last_activated = datetime('now')`)
+      .run(source.id, target.id, relation_type, weight, JSON.stringify(properties), weight);
+
+    return {
+      content: [{ type: 'text' as const, text: `Link: "${source_name}" -[${relation_type}]-> "${target_name}" (weight: ${weight})` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 6: query_graph — Recursive CTE traversal (≤3 hops)
+// ============================================================
+server.tool(
+  'query_graph',
+  'Traverse the knowledge graph from a starting entity. Uses recursive CTE, bounded to 3 hops max.',
+  {
+    start_name: z.string(),
+    start_type: z.string(),
+    max_hops: z.number().min(1).max(3).optional().default(2),
+    relation_filter: z.string().optional().describe('Filter edges by relation type'),
+    min_weight: z.number().min(0).max(1).optional().default(0.0),
+  },
+  async ({ start_name, start_type, max_hops, relation_filter, min_weight }) => {
+    const db = getDb();
+
+    const start = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
+      .get(start_name, start_type) as any;
+    if (!start) return { content: [{ type: 'text' as const, text: `Entity "${start_name}" (${start_type}) not found.` }] };
+
+    let relationClause = '';
+    const params: any[] = [start.id, min_weight];
+
+    if (relation_filter) {
+      relationClause = 'AND e.relation_type = ?';
+      params.push(relation_filter);
+    }
+
+    // Always push max_hops for the WHERE clause
+    params.push(max_hops);
+
+    const sql = `
+      WITH RECURSIVE traverse(entity_id, depth, path) AS (
+        SELECT ?, 0, CAST(? AS TEXT)
+        UNION ALL
+        SELECT e.target_id, t.depth + 1,
+          t.path || ' -> ' || (SELECT name FROM kg_entities WHERE id = e.target_id)
+        FROM traverse t
+        JOIN kg_edges e ON e.source_id = t.entity_id
+        WHERE t.depth < ? AND e.weight >= ? ${relationClause}
+      )
+      SELECT DISTINCT
+        ent.id, ent.name, ent.entity_type, ent.tier,
+        ent.community_id, ent.betweenness, ent.importance,
+        t.depth, t.path
+      FROM traverse t
+      JOIN kg_entities ent ON ent.id = t.entity_id
+      WHERE t.depth > 0
+      ORDER BY t.depth, ent.importance DESC`;
+
+    // Reorder params: start.id, start.id (as path seed), max_hops, min_weight, [relation_filter]
+    const queryParams = [start.id, start_name, max_hops, min_weight];
+    if (relation_filter) queryParams.push(relation_filter);
+
+    const results = db.prepare(sql).all(...queryParams);
+
+    // Also update activation counts for traversed edges
+    db.prepare(`UPDATE kg_edges SET activation_count = activation_count + 1, last_activated = datetime('now')
+      WHERE source_id = ?`).run(start.id);
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 7: store_hypothesis — Add/update hypothesis
+// ============================================================
+server.tool(
+  'store_hypothesis',
+  'Store or update a research hypothesis in the cascade.',
+  {
+    cascade_id: z.string(),
+    statement: z.string(),
+    parent_id: z.string().optional(),
+    affinity: z.number().min(0).max(1).optional().default(0.5),
+    status: z.enum(['proposed', 'testing', 'supported', 'refuted', 'uncertain', 'archived']).optional().default('proposed'),
+    supporting_ids: z.array(z.string()).optional().default([]),
+    contradicting_ids: z.array(z.string()).optional().default([]),
+  },
+  async ({ cascade_id, statement, parent_id, affinity, status, supporting_ids, contradicting_ids }) => {
+    const db = getDb();
+    const id = contentHash(statement);
+
+    const existing = db.prepare('SELECT id FROM hypotheses WHERE id = ?').get(id) as any;
+
+    if (existing) {
+      db.prepare(`UPDATE hypotheses SET
+        affinity = ?, status = ?,
+        supporting = json_insert(supporting, '$[#]', ?),
+        contradicting = json_insert(contradicting, '$[#]', ?),
+        updated_at = datetime('now')
+        WHERE id = ?`)
+        .run(affinity, status, JSON.stringify(supporting_ids), JSON.stringify(contradicting_ids), id);
+    } else {
+      const generation = parent_id
+        ? ((db.prepare('SELECT generation FROM hypotheses WHERE id = ?').get(parent_id) as any)?.generation ?? 0) + 1
+        : 0;
+
+      db.prepare(`INSERT INTO hypotheses (id, cascade_id, statement, parent_id, affinity, generation, status, supporting, contradicting)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, cascade_id, statement, parent_id, affinity, generation, status, JSON.stringify(supporting_ids), JSON.stringify(contradicting_ids));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Hypothesis ${id}: "${statement.slice(0, 80)}..." (affinity: ${affinity}, status: ${status})` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 8: get_hypotheses — Query hypothesis population
+// ============================================================
+server.tool(
+  'get_hypotheses',
+  'Query hypotheses for a cascade, optionally filtered by status.',
+  {
+    cascade_id: z.string(),
+    status: z.enum(['proposed', 'testing', 'supported', 'refuted', 'uncertain', 'archived']).optional(),
+    min_affinity: z.number().min(0).max(1).optional(),
+  },
+  async ({ cascade_id, status, min_affinity }) => {
+    const db = getDb();
+    let sql = 'SELECT * FROM hypotheses WHERE cascade_id = ?';
+    const params: any[] = [cascade_id];
+
+    if (status) { sql += ' AND status = ?'; params.push(status); }
+    if (min_affinity !== undefined) { sql += ' AND affinity >= ?'; params.push(min_affinity); }
+
+    sql += ' ORDER BY affinity DESC';
+    const results = db.prepare(sql).all(...params);
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 9: cascade_init — Initialize a new research cascade
+// ============================================================
+server.tool(
+  'cascade_init',
+  'Initialize a new research cascade with a question. Returns cascade ID.',
+  {
+    question: z.string().describe('The research question to investigate'),
+    max_rounds: z.number().optional().default(5),
+    token_budget: z.number().optional().default(500000),
+  },
+  async ({ question, max_rounds, token_budget }) => {
+    const db = getDb();
+    const id = generateId();
+
+    db.prepare(`INSERT INTO cascades (id, question, status, max_rounds, token_budget)
+      VALUES (?, ?, 'planning', ?, ?)`)
+      .run(id, question, max_rounds, token_budget);
+
+    return {
+      content: [{ type: 'text' as const, text: `Cascade initialized: ${id}\nQuestion: ${question}\nMax rounds: ${max_rounds}\nToken budget: ${token_budget}\n\nNext: store_plan to lock research criteria, then update_status to begin.` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 10: get_status — Cascade state + metrics
+// ============================================================
+server.tool(
+  'get_status',
+  'Get current cascade status including progress, findings count, hypothesis count, and PID state.',
+  {
+    cascade_id: z.string().optional().describe('Specific cascade ID, or omit for all active cascades'),
+  },
+  async ({ cascade_id }) => {
+    const db = getDb();
+
+    if (cascade_id) {
+      const cascade = db.prepare('SELECT * FROM cascades WHERE id = ?').get(cascade_id) as any;
+      if (!cascade) return { content: [{ type: 'text' as const, text: `Cascade ${cascade_id} not found.` }] };
+
+      const findingsCount = (db.prepare('SELECT COUNT(*) as n FROM findings WHERE cascade_id = ?').get(cascade_id) as any).n;
+      const quarantinedCount = (db.prepare('SELECT COUNT(*) as n FROM findings WHERE cascade_id = ? AND quarantined = 1').get(cascade_id) as any).n;
+      const hypothesesCount = (db.prepare('SELECT COUNT(*) as n FROM hypotheses WHERE cascade_id = ?').get(cascade_id) as any).n;
+      const threadsCount = (db.prepare('SELECT COUNT(*) as n FROM threads WHERE cascade_id = ?').get(cascade_id) as any).n;
+      const entityCount = (db.prepare('SELECT COUNT(*) as n FROM kg_entities').get() as any).n;
+      const edgeCount = (db.prepare('SELECT COUNT(*) as n FROM kg_edges').get() as any).n;
+
+      // Check for pending steer events
+      const pendingSteers = db.prepare('SELECT * FROM steer_events WHERE cascade_id = ? AND applied = 0 ORDER BY created_at').all(cascade_id);
+
+      const status = {
+        ...cascade,
+        pid_state: cascade.pid_state_json ? JSON.parse(cascade.pid_state_json) : null,
+        plan: cascade.plan_json ? JSON.parse(cascade.plan_json) : null,
+        counts: { findings: findingsCount, quarantined: quarantinedCount, hypotheses: hypothesesCount, threads: threadsCount, entities: entityCount, edges: edgeCount },
+        pending_steers: pendingSteers,
+        exploration_budget: Math.max(0, 1 - cascade.current_round / cascade.max_rounds),
+      };
+
+      return { content: [{ type: 'text' as const, text: JSON.stringify(status, null, 2) }] };
+    }
+
+    // All active cascades
+    const cascades = db.prepare("SELECT id, question, status, current_round, max_rounds, created_at FROM cascades WHERE status NOT IN ('complete') ORDER BY updated_at DESC").all();
+    return { content: [{ type: 'text' as const, text: JSON.stringify(cascades, null, 2) }] };
+  }
+);
+
+// ============================================================
+// TOOL 11: update_status — Advance phase/round
+// ============================================================
+server.tool(
+  'update_status',
+  'Update cascade status and/or advance to next round.',
+  {
+    cascade_id: z.string(),
+    status: z.enum(['planning', 'investigating', 'validating', 'synthesizing', 'complete', 'stalled']).optional(),
+    advance_round: z.boolean().optional().default(false).describe('Increment current_round by 1'),
+    pid_state: z.object({
+      error: z.number(),
+      integral: z.number(),
+      derivative: z.number(),
+      output: z.number(),
+      kp: z.number().optional(),
+      ki: z.number().optional(),
+      kd: z.number().optional(),
+    }).optional(),
+    tokens_used: z.number().optional().describe('Add to running token count'),
+  },
+  async ({ cascade_id, status, advance_round, pid_state, tokens_used }) => {
+    const db = getDb();
+
+    const cascade = db.prepare('SELECT * FROM cascades WHERE id = ?').get(cascade_id) as any;
+    if (!cascade) return { content: [{ type: 'text' as const, text: `Cascade ${cascade_id} not found.` }] };
+
+    const updates: string[] = ["updated_at = datetime('now')"];
+    const params: any[] = [];
+
+    if (status) { updates.push('status = ?'); params.push(status); }
+    if (advance_round) {
+      const newRound = cascade.current_round + 1;
+      updates.push('current_round = ?');
+      params.push(newRound);
+      updates.push('exploration_budget = ?');
+      params.push(Math.max(0, 1 - newRound / cascade.max_rounds));
+    }
+    if (pid_state) {
+      updates.push('pid_state_json = ?');
+      params.push(JSON.stringify(pid_state));
+    }
+    if (tokens_used) {
+      updates.push('tokens_used = tokens_used + ?');
+      params.push(tokens_used);
+    }
+
+    params.push(cascade_id);
+    db.prepare(`UPDATE cascades SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+    const updated = db.prepare('SELECT id, status, current_round, max_rounds, tokens_used, token_budget FROM cascades WHERE id = ?').get(cascade_id);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(updated, null, 2) }] };
+  }
+);
+
+// ============================================================
+// TOOL 12: get_metrics — Information-theoretic dashboard
+// ============================================================
+server.tool(
+  'get_metrics',
+  'Get cascade quality metrics: coverage, depth, confidence distribution, source diversity.',
+  {
+    cascade_id: z.string(),
+  },
+  async ({ cascade_id }) => {
+    const db = getDb();
+
+    const cascade = db.prepare('SELECT * FROM cascades WHERE id = ?').get(cascade_id) as any;
+    if (!cascade) return { content: [{ type: 'text' as const, text: `Cascade ${cascade_id} not found.` }] };
+
+    // Aggregate metrics
+    const findings = db.prepare('SELECT confidence, trust_composite, source_url, grade_level, cascade_round FROM findings WHERE cascade_id = ? AND quarantined = 0').all(cascade_id) as any[];
+
+    const avgConfidence = findings.length ? findings.reduce((s: number, f: any) => s + f.confidence, 0) / findings.length : 0;
+    const avgTrust = findings.length ? findings.reduce((s: number, f: any) => s + (f.trust_composite || 0.5), 0) / findings.length : 0;
+
+    // Source diversity
+    const domains = new Set(findings.map((f: any) => {
+      try { return new URL(f.source_url || '').hostname; } catch { return 'unknown'; }
+    }));
+
+    // Confidence distribution
+    const confBuckets = { high: 0, medium: 0, low: 0 };
+    for (const f of findings) {
+      if (f.confidence >= 0.7) confBuckets.high++;
+      else if (f.confidence >= 0.4) confBuckets.medium++;
+      else confBuckets.low++;
+    }
+
+    // Grade distribution
+    const gradeDist: Record<string, number> = {};
+    for (const f of findings) {
+      const g = f.grade_level || 'ungraded';
+      gradeDist[g] = (gradeDist[g] || 0) + 1;
+    }
+
+    // Hypotheses status
+    const hypStats = db.prepare(`SELECT status, COUNT(*) as n FROM hypotheses WHERE cascade_id = ? GROUP BY status`).all(cascade_id);
+
+    // Graph stats
+    const entityCount = (db.prepare('SELECT COUNT(*) as n FROM kg_entities').get() as any).n;
+    const edgeCount = (db.prepare('SELECT COUNT(*) as n FROM kg_edges').get() as any).n;
+    const avgDegree = entityCount > 0 ? (2 * edgeCount) / entityCount : 0;
+
+    // Recent metrics from metrics table
+    const recentMetrics = db.prepare(`SELECT metric_name, metric_value, recorded_at FROM metrics
+      WHERE cascade_id = ? ORDER BY recorded_at DESC LIMIT 20`).all(cascade_id);
+
+    const dashboard = {
+      cascade: { id: cascade_id, status: cascade.status, round: cascade.current_round, maxRounds: cascade.max_rounds },
+      quality: {
+        totalFindings: findings.length,
+        avgConfidence: Math.round(avgConfidence * 1000) / 1000,
+        avgTrust: Math.round(avgTrust * 1000) / 1000,
+        confidenceDistribution: confBuckets,
+        gradeDistribution: gradeDist,
+        sourceDiversity: domains.size,
+      },
+      hypotheses: hypStats,
+      graph: { entities: entityCount, edges: edgeCount, avgDegree: Math.round(avgDegree * 100) / 100 },
+      tokens: { used: cascade.tokens_used, budget: cascade.token_budget, remaining: cascade.token_budget - cascade.tokens_used },
+      explorationBudget: Math.max(0, 1 - cascade.current_round / cascade.max_rounds),
+      recentMetrics,
+    };
+
+    return { content: [{ type: 'text' as const, text: JSON.stringify(dashboard, null, 2) }] };
+  }
+);
+
+// ============================================================
+// TOOL 13: store_checkpoint — Step-level checkpointing
+// ============================================================
+server.tool(
+  'store_checkpoint',
+  'Save a checkpoint for crash recovery. Each step is checkpointed independently.',
+  {
+    task_id: z.string(),
+    round_index: z.number(),
+    step_index: z.number(),
+    step_name: z.string(),
+    status: z.enum(['pending', 'running', 'done', 'failed', 'skipped']),
+    state_snapshot: z.string().optional().describe('JSON state to restore from'),
+    error_message: z.string().optional(),
+  },
+  async ({ task_id, round_index, step_index, step_name, status, state_snapshot, error_message }) => {
+    const db = getDb();
+    const idempotencyKey = `${task_id}:${round_index}:${step_index}:${step_name}`;
+
+    db.prepare(`INSERT INTO cascade_checkpoints (task_id, round_index, step_index, step_name, status, state_snapshot, idempotency_key, error_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id, round_index, step_index) DO UPDATE SET
+        status = excluded.status,
+        state_snapshot = COALESCE(excluded.state_snapshot, state_snapshot),
+        error_message = excluded.error_message,
+        completed_at = CASE WHEN excluded.status IN ('done','failed','skipped') THEN datetime('now') ELSE NULL END`)
+      .run(task_id, round_index, step_index, step_name, status, state_snapshot, idempotencyKey, error_message);
+
+    return {
+      content: [{ type: 'text' as const, text: `Checkpoint: ${task_id} R${round_index}S${step_index} "${step_name}" → ${status}` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 14: steer — Submit human steering event
+// ============================================================
+server.tool(
+  'steer',
+  'Submit a steering event to redirect an active cascade.',
+  {
+    cascade_id: z.string(),
+    event_type: z.enum(['redirect', 'narrow', 'broaden', 'add_question', 'drop_hypothesis', 'approve', 'reject']),
+    instruction: z.string(),
+    target_id: z.string().optional().describe('ID of hypothesis or finding to target'),
+  },
+  async ({ cascade_id, event_type, instruction, target_id }) => {
+    const db = getDb();
+
+    db.prepare('INSERT INTO steer_events (cascade_id, event_type, instruction, target_id) VALUES (?, ?, ?, ?)')
+      .run(cascade_id, event_type, instruction, target_id);
+
+    return {
+      content: [{ type: 'text' as const, text: `Steer event queued: ${event_type} — "${instruction}". Will be applied on next cascade iteration.` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 15: record_metric — Store a metric value
+// ============================================================
+server.tool(
+  'record_metric',
+  'Record a metric value for tracking cascade health over time.',
+  {
+    cascade_id: z.string(),
+    round_index: z.number().optional(),
+    metric_name: z.string().describe('e.g., entropy, coverage, confidence_avg, pid_error, ncd_dedup_ratio'),
+    metric_value: z.number(),
+  },
+  async ({ cascade_id, round_index, metric_name, metric_value }) => {
+    const db = getDb();
+    db.prepare('INSERT INTO metrics (cascade_id, round_index, metric_name, metric_value) VALUES (?, ?, ?, ?)')
+      .run(cascade_id, round_index, metric_name, metric_value);
+
+    return {
+      content: [{ type: 'text' as const, text: `Metric recorded: ${metric_name} = ${metric_value}` }],
+    };
+  }
+);
+
+// ============================================================
+// Server startup
+// ============================================================
+async function main(): Promise<void> {
+  // Initialize DB on startup to catch schema errors early
+  try {
+    getDb();
+    console.error('[cascade-engine] Database initialized');
+  } catch (err) {
+    console.error('[cascade-engine] DB initialization failed:', err);
+    process.exit(1);
+  }
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('[cascade-engine] MCP server running on stdio');
+}
+
+main().catch((err) => {
+  console.error('[cascade-engine] Fatal:', err);
+  closeDb();
+  process.exit(1);
+});
