@@ -1,6 +1,6 @@
 {
   "name": "@obsidicore/cascade-engine",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Progressive deep research engine with knowledge graph, trust scoring, and self-regulation. MCP server for Claude Code, OpenClaw, or any MCP client.",
   "type": "module",
   "main": "dist/index.js",
