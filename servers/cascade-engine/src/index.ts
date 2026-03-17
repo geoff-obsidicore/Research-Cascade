@@ -337,13 +337,21 @@ server.tool(
     const existing = db.prepare('SELECT id FROM hypotheses WHERE id = ?').get(id) as any;
 
     if (existing) {
+      // Merge new IDs into existing arrays (flat, no nesting)
+      const current = db.prepare('SELECT supporting, contradicting FROM hypotheses WHERE id = ?').get(id) as any;
+      const existingSupporting: string[] = JSON.parse(current.supporting || '[]');
+      const existingContradicting: string[] = JSON.parse(current.contradicting || '[]');
+
+      const mergedSupporting = [...new Set([...existingSupporting, ...supporting_ids])];
+      const mergedContradicting = [...new Set([...existingContradicting, ...contradicting_ids])];
+
       db.prepare(`UPDATE hypotheses SET
         affinity = ?, status = ?,
-        supporting = json_insert(supporting, '$[#]', ?),
-        contradicting = json_insert(contradicting, '$[#]', ?),
+        supporting = ?,
+        contradicting = ?,
         updated_at = datetime('now')
         WHERE id = ?`)
-        .run(affinity, status, JSON.stringify(supporting_ids), JSON.stringify(contradicting_ids), id);
+        .run(affinity, status, JSON.stringify(mergedSupporting), JSON.stringify(mergedContradicting), id);
     } else {
       const generation = parent_id
         ? ((db.prepare('SELECT generation FROM hypotheses WHERE id = ?').get(parent_id) as any)?.generation ?? 0) + 1
@@ -436,15 +444,20 @@ server.tool(
       const entityCount = (db.prepare('SELECT COUNT(*) as n FROM kg_entities').get() as any).n;
       const edgeCount = (db.prepare('SELECT COUNT(*) as n FROM kg_edges').get() as any).n;
 
-      // Check for pending steer events
-      const pendingSteers = db.prepare('SELECT * FROM steer_events WHERE cascade_id = ? AND applied = 0 ORDER BY created_at').all(cascade_id);
+      // Auto-apply pending steer events
+      const pendingSteers = db.prepare('SELECT * FROM steer_events WHERE cascade_id = ? AND applied = 0 ORDER BY created_at').all(cascade_id) as any[];
+      const appliedSteers: string[] = [];
+      for (const steer of pendingSteers) {
+        db.prepare('UPDATE steer_events SET applied = 1 WHERE id = ?').run(steer.id);
+        appliedSteers.push(`[${steer.event_type}] ${steer.instruction}`);
+      }
 
       const status = {
         ...cascade,
         pid_state: cascade.pid_state_json ? JSON.parse(cascade.pid_state_json) : null,
         plan: cascade.plan_json ? JSON.parse(cascade.plan_json) : null,
         counts: { findings: findingsCount, quarantined: quarantinedCount, hypotheses: hypothesesCount, threads: threadsCount, entities: entityCount, edges: edgeCount },
-        pending_steers: pendingSteers,
+        applied_steers: appliedSteers.length > 0 ? appliedSteers : undefined,
         exploration_budget: Math.max(0, 1 - cascade.current_round / cascade.max_rounds),
       };
 
