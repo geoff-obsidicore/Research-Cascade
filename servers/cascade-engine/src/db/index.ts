@@ -41,7 +41,16 @@ export function __setTestDb(db: Database.Database | null): void {
 export function getDb(options?: DatabaseOptions): Database.Database {
   if (_db) return _db;
 
-  const dbPath = options?.dbPath || process.env.CASCADE_DB_PATH || getDefaultDbPath();
+  const rawDbPath = options?.dbPath || process.env.CASCADE_DB_PATH || getDefaultDbPath();
+  const dbPath = join(rawDbPath); // Normalize
+
+  // Validate DB path — reject system directories
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const forbidden = ['/etc', '/sys', '/proc', '/dev', 'C:\\Windows', 'C:\\Program Files'];
+  if (forbidden.some(f => dbPath.toLowerCase().startsWith(f.toLowerCase()))) {
+    throw new Error(`Refusing to create database in system directory: ${dbPath}`);
+  }
+
   const dbDir = dirname(dbPath);
   if (!existsSync(dbDir)) {
     mkdirSync(dbDir, { recursive: true });

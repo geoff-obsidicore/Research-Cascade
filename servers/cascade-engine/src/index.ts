@@ -18,6 +18,14 @@ import { checkInterventions, formatInterventions } from './hitl/interventions.js
 import { renderDashboard, buildDashboardData } from './hitl/dashboard.js';
 import { createNote, linkNotes, extractNotesFromFinding, updateMaturity, getNoteStats, searchNotes } from './graph/amem.js';
 
+// --- Input length limits (security) ---
+const MAX_ID = 100;
+const MAX_SHORT = 500;    // names, types, filters, keywords
+const MAX_CLAIM = 10000;  // claims, evidence, statements
+const MAX_QUESTION = 2000;
+const MAX_URL = 2000;
+const MAX_SNAPSHOT = 50000; // checkpoint state snapshots
+
 const server = new McpServer({
   name: 'cascade-engine',
   version: '0.1.0',
@@ -30,11 +38,11 @@ server.tool(
   'store_plan',
   'Save an immutable research plan for a cascade. Locks questions and criteria at round start to prevent HARKing.',
   {
-    cascade_id: z.string().describe('Cascade ID to attach the plan to'),
+    cascade_id: z.string().max(MAX_ID).describe('Cascade ID to attach the plan to'),
     plan: z.object({
-      questions: z.array(z.string()).describe('Research questions to investigate'),
-      success_criteria: z.array(z.string()).describe('How we know when we have a good answer'),
-      scope_boundaries: z.array(z.string()).optional().describe('What is explicitly out of scope'),
+      questions: z.array(z.string().max(MAX_QUESTION)).max(20).describe('Research questions to investigate'),
+      success_criteria: z.array(z.string().max(MAX_SHORT)).max(20).describe('How we know when we have a good answer'),
+      scope_boundaries: z.array(z.string().max(MAX_SHORT)).optional().describe('What is explicitly out of scope'),
       max_rounds: z.number().optional().default(5),
       token_budget: z.number().optional().default(500000),
     }).describe('The research plan to lock in'),
@@ -71,11 +79,11 @@ server.tool(
   'store_finding',
   'Store a research finding. Generates content-addressable ID. Trust scoring applied automatically.',
   {
-    cascade_id: z.string(),
-    thread_id: z.string().optional(),
-    claim: z.string().describe('The factual claim or finding'),
-    evidence: z.string().optional().describe('Supporting evidence or context'),
-    source_url: z.string().optional(),
+    cascade_id: z.string().max(MAX_ID),
+    thread_id: z.string().max(MAX_ID).optional(),
+    claim: z.string().max(MAX_CLAIM).describe('The factual claim or finding'),
+    evidence: z.string().max(MAX_CLAIM).optional().describe('Supporting evidence or context'),
+    source_url: z.string().max(MAX_URL).optional(),
     source_type: z.enum(['primary', 'secondary', 'tertiary']).optional(),
     confidence: z.number().min(0).max(1).optional().default(0.5),
     cascade_round: z.number(),
@@ -103,8 +111,8 @@ server.tool(
   'get_findings',
   'Query stored findings using full-text search and/or filters.',
   {
-    cascade_id: z.string().optional(),
-    query: z.string().optional().describe('FTS search query'),
+    cascade_id: z.string().max(MAX_ID).optional(),
+    query: z.string().max(MAX_SHORT).optional().describe('FTS search query'),
     min_confidence: z.number().min(0).max(1).optional(),
     include_quarantined: z.boolean().optional().default(false),
     round: z.number().optional(),
@@ -136,7 +144,12 @@ server.tool(
     sql += ' ORDER BY confidence DESC LIMIT ?';
     params.push(limit);
 
-    const findings = db.prepare(sql).all(...params);
+    let findings: any[];
+    try {
+      findings = db.prepare(sql).all(...params);
+    } catch (err: any) {
+      return { content: [{ type: 'text' as const, text: `Query error: ${err.message}. If using FTS, ensure proper syntax (AND, OR, NOT, "quoted phrases").` }] };
+    }
 
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(findings, null, 2) }],
@@ -151,9 +164,9 @@ server.tool(
   'add_entity',
   'Add an entity to the knowledge graph. Upserts on (name, entity_type).',
   {
-    name: z.string(),
-    entity_type: z.string().describe('e.g., concept, person, tool, technique, paper'),
-    properties: z.record(z.any()).optional().default({}),
+    name: z.string().max(MAX_SHORT),
+    entity_type: z.string().max(MAX_SHORT).describe('e.g., concept, person, tool, technique, paper'),
+    properties: z.record(z.unknown()).optional().default({}),
     tier: z.enum(['peripheral', 'working', 'core']).optional().default('working'),
     importance: z.number().min(0).max(1).optional().default(0.5),
   },
@@ -185,13 +198,13 @@ server.tool(
   'add_link',
   'Add a directional link between two knowledge graph entities.',
   {
-    source_name: z.string(),
-    source_type: z.string(),
-    target_name: z.string(),
-    target_type: z.string(),
-    relation_type: z.string().describe('e.g., relates_to, causes, contradicts, supports, uses, part_of'),
+    source_name: z.string().max(MAX_SHORT),
+    source_type: z.string().max(MAX_SHORT),
+    target_name: z.string().max(MAX_SHORT),
+    target_type: z.string().max(MAX_SHORT),
+    relation_type: z.string().max(MAX_SHORT).describe('e.g., relates_to, causes, contradicts, supports, uses, part_of'),
     weight: z.number().min(0).max(1).optional().default(1.0),
-    properties: z.record(z.any()).optional().default({}),
+    properties: z.record(z.unknown()).optional().default({}),
   },
   async ({ source_name, source_type, target_name, target_type, relation_type, weight, properties }) => {
     const db = getDb();
@@ -225,78 +238,71 @@ server.tool(
   'query_graph',
   'Traverse the knowledge graph from a starting entity. Uses recursive CTE, bounded to 3 hops max. Follows edges in both directions by default.',
   {
-    start_name: z.string(),
-    start_type: z.string(),
+    start_name: z.string().max(MAX_SHORT),
+    start_type: z.string().max(MAX_SHORT),
     max_hops: z.number().min(1).max(3).optional().default(2),
     direction: z.enum(['outgoing', 'incoming', 'both']).optional().default('both').describe('Edge direction to follow'),
-    relation_filter: z.string().optional().describe('Filter edges by relation type'),
+    relation_filter: z.string().max(MAX_SHORT).optional().describe('Filter edges by relation type'),
     min_weight: z.number().min(0).max(1).optional().default(0.0),
   },
   async ({ start_name, start_type, max_hops, direction, relation_filter, min_weight }) => {
     const db = getDb();
 
-    const start = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
+    const start = db.prepare('SELECT id, name FROM kg_entities WHERE name = ? AND entity_type = ?')
       .get(start_name, start_type) as any;
     if (!start) return { content: [{ type: 'text' as const, text: `Entity "${start_name}" (${start_type}) not found.` }] };
 
-    let relationClause = '';
+    // Validate relation_filter against actual relation types in DB (whitelist approach)
     if (relation_filter) {
-      relationClause = `AND e.relation_type = '${relation_filter.replace(/'/g, "''")}'`;
+      const validRelations = db.prepare('SELECT DISTINCT relation_type FROM kg_edges').all() as any[];
+      const validSet = new Set(validRelations.map((r: any) => r.relation_type));
+      if (!validSet.has(relation_filter)) {
+        return { content: [{ type: 'text' as const, text: `Unknown relation type "${relation_filter}". Valid types: ${[...validSet].join(', ')}` }] };
+      }
     }
 
-    // Build directional join clauses
-    let edgeJoins: string;
-    if (direction === 'outgoing') {
-      edgeJoins = `
-        SELECT e.target_id, t.depth + 1,
-          t.path || ' -[' || e.relation_type || ']-> ' || tgt.name,
-          t.visited || ',' || CAST(e.target_id AS TEXT)
-        FROM traverse t
-        JOIN kg_edges e ON e.source_id = t.entity_id
-        JOIN kg_entities tgt ON tgt.id = e.target_id
-        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
-          AND t.visited NOT LIKE '%,' || CAST(e.target_id AS TEXT) || ',%'
-          ${relationClause}`;
-    } else if (direction === 'incoming') {
-      edgeJoins = `
-        SELECT e.source_id, t.depth + 1,
-          t.path || ' <-[' || e.relation_type || ']- ' || src.name,
-          t.visited || ',' || CAST(e.source_id AS TEXT)
-        FROM traverse t
-        JOIN kg_edges e ON e.target_id = t.entity_id
-        JOIN kg_entities src ON src.id = e.source_id
-        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
-          AND t.visited NOT LIKE '%,' || CAST(e.source_id AS TEXT) || ',%'
-          ${relationClause}`;
+    // Use a filtered edges temp approach: pre-filter edges, then traverse
+    // This avoids string interpolation in the recursive CTE entirely
+    const startId: number = start.id;
+    const startLabel: string = start.name;
+
+    // Pre-filter edges into a temp table for safe parameterized traversal
+    db.exec('CREATE TEMP TABLE IF NOT EXISTS _trav_edges (source_id INTEGER, target_id INTEGER, relation_type TEXT, weight REAL)');
+    db.exec('DELETE FROM _trav_edges');
+
+    if (relation_filter) {
+      if (direction === 'outgoing' || direction === 'both') {
+        db.prepare('INSERT INTO _trav_edges SELECT source_id, target_id, relation_type, weight FROM kg_edges WHERE weight >= ? AND relation_type = ?')
+          .run(min_weight, relation_filter);
+      }
+      if (direction === 'incoming' || direction === 'both') {
+        // For incoming: swap source/target so the CTE always follows source→target
+        db.prepare('INSERT INTO _trav_edges SELECT target_id, source_id, relation_type, weight FROM kg_edges WHERE weight >= ? AND relation_type = ?')
+          .run(min_weight, relation_filter);
+      }
     } else {
-      // both directions
-      edgeJoins = `
-        SELECT e.target_id, t.depth + 1,
-          t.path || ' -[' || e.relation_type || ']-> ' || tgt.name,
-          t.visited || ',' || CAST(e.target_id AS TEXT)
-        FROM traverse t
-        JOIN kg_edges e ON e.source_id = t.entity_id
-        JOIN kg_entities tgt ON tgt.id = e.target_id
-        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
-          AND t.visited NOT LIKE '%,' || CAST(e.target_id AS TEXT) || ',%'
-          ${relationClause}
-        UNION ALL
-        SELECT e.source_id, t.depth + 1,
-          t.path || ' <-[' || e.relation_type || ']- ' || src.name,
-          t.visited || ',' || CAST(e.source_id AS TEXT)
-        FROM traverse t
-        JOIN kg_edges e ON e.target_id = t.entity_id
-        JOIN kg_entities src ON src.id = e.source_id
-        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
-          AND t.visited NOT LIKE '%,' || CAST(e.source_id AS TEXT) || ',%'
-          ${relationClause}`;
+      if (direction === 'outgoing' || direction === 'both') {
+        db.prepare('INSERT INTO _trav_edges SELECT source_id, target_id, relation_type, weight FROM kg_edges WHERE weight >= ?')
+          .run(min_weight);
+      }
+      if (direction === 'incoming' || direction === 'both') {
+        db.prepare('INSERT INTO _trav_edges SELECT target_id, source_id, relation_type, weight FROM kg_edges WHERE weight >= ?')
+          .run(min_weight);
+      }
     }
 
-    const sql = `
+    // Now the CTE uses only integer IDs from our own tables — no user strings in SQL
+    const results = db.prepare(`
       WITH RECURSIVE traverse(entity_id, depth, path, visited) AS (
-        SELECT ${start.id}, 0, '${start_name.replace(/'/g, "''")}', ',${start.id},'
+        SELECT ?, 0, ?, ?
         UNION ALL
-        ${edgeJoins}
+        SELECT e.target_id, t.depth + 1,
+          t.path || ' -> ' || (SELECT name FROM kg_entities WHERE id = e.target_id),
+          t.visited || ',' || CAST(e.target_id AS TEXT)
+        FROM traverse t
+        JOIN _trav_edges e ON e.source_id = t.entity_id
+        WHERE t.depth < ?
+          AND t.visited NOT LIKE '%,' || CAST(e.target_id AS TEXT) || ',%'
       )
       SELECT DISTINCT
         ent.id, ent.name, ent.entity_type, ent.tier,
@@ -305,13 +311,14 @@ server.tool(
       FROM traverse t
       JOIN kg_entities ent ON ent.id = t.entity_id
       WHERE t.depth > 0
-      ORDER BY t.depth, ent.importance DESC`;
+      ORDER BY t.depth, ent.importance DESC
+    `).all(startId, startLabel, `,${startId},`, max_hops);
 
-    const results = db.prepare(sql).all();
+    db.exec('DELETE FROM _trav_edges');
 
-    // Update activation counts for traversed edges
-    db.prepare(`UPDATE kg_edges SET activation_count = activation_count + 1, last_activated = datetime('now')
-      WHERE source_id = ? OR target_id = ?`).run(start.id, start.id);
+    // Update activation counts
+    db.prepare('UPDATE kg_edges SET activation_count = activation_count + 1, last_activated = datetime(\'now\') WHERE source_id = ? OR target_id = ?')
+      .run(startId, startId);
 
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }],
@@ -326,13 +333,13 @@ server.tool(
   'store_hypothesis',
   'Store or update a research hypothesis in the cascade.',
   {
-    cascade_id: z.string(),
-    statement: z.string(),
-    parent_id: z.string().optional(),
+    cascade_id: z.string().max(MAX_ID),
+    statement: z.string().max(MAX_CLAIM),
+    parent_id: z.string().max(MAX_ID).optional(),
     affinity: z.number().min(0).max(1).optional().default(0.5),
     status: z.enum(['proposed', 'testing', 'supported', 'refuted', 'uncertain', 'archived']).optional().default('proposed'),
-    supporting_ids: z.array(z.string()).optional().default([]),
-    contradicting_ids: z.array(z.string()).optional().default([]),
+    supporting_ids: z.array(z.string().max(MAX_ID)).max(50).optional().default([]),
+    contradicting_ids: z.array(z.string().max(MAX_ID)).max(50).optional().default([]),
   },
   async ({ cascade_id, statement, parent_id, affinity, status, supporting_ids, contradicting_ids }) => {
     const db = getDb();
@@ -379,7 +386,7 @@ server.tool(
   'get_hypotheses',
   'Query hypotheses for a cascade, optionally filtered by status.',
   {
-    cascade_id: z.string(),
+    cascade_id: z.string().max(MAX_ID),
     status: z.enum(['proposed', 'testing', 'supported', 'refuted', 'uncertain', 'archived']).optional(),
     min_affinity: z.number().min(0).max(1).optional(),
   },
@@ -407,7 +414,7 @@ server.tool(
   'cascade_init',
   'Initialize a new research cascade with a question. Returns cascade ID.',
   {
-    question: z.string().describe('The research question to investigate'),
+    question: z.string().max(MAX_QUESTION).describe('The research question to investigate'),
     max_rounds: z.number().optional().default(5),
     token_budget: z.number().optional().default(500000),
   },
@@ -432,7 +439,7 @@ server.tool(
   'get_status',
   'Get current cascade status including progress, findings count, hypothesis count, and PID state.',
   {
-    cascade_id: z.string().optional().describe('Specific cascade ID, or omit for all active cascades'),
+    cascade_id: z.string().max(MAX_ID).optional().describe('Specific cascade ID, or omit for all active cascades'),
   },
   async ({ cascade_id }) => {
     const db = getDb();
@@ -494,7 +501,7 @@ server.tool(
   'update_status',
   'Update cascade status and/or advance to next round.',
   {
-    cascade_id: z.string(),
+    cascade_id: z.string().max(MAX_ID),
     status: z.enum(['planning', 'investigating', 'validating', 'synthesizing', 'complete', 'stalled']).optional(),
     advance_round: z.boolean().optional().default(false).describe('Increment current_round by 1'),
     pid_state: z.object({
@@ -574,7 +581,7 @@ server.tool(
   'get_metrics',
   'Get cascade quality metrics: coverage, depth, confidence distribution, source diversity.',
   {
-    cascade_id: z.string(),
+    cascade_id: z.string().max(MAX_ID),
   },
   async ({ cascade_id }) => {
     const db = getDb();
@@ -675,13 +682,13 @@ server.tool(
   'store_checkpoint',
   'Save a checkpoint for crash recovery. Each step is checkpointed independently.',
   {
-    task_id: z.string(),
+    task_id: z.string().max(MAX_ID),
     round_index: z.number(),
     step_index: z.number(),
-    step_name: z.string(),
+    step_name: z.string().max(MAX_SHORT),
     status: z.enum(['pending', 'running', 'done', 'failed', 'skipped']),
-    state_snapshot: z.string().optional().describe('JSON state to restore from'),
-    error_message: z.string().optional(),
+    state_snapshot: z.string().max(MAX_SNAPSHOT).optional().describe('JSON state to restore from'),
+    error_message: z.string().max(MAX_CLAIM).optional(),
   },
   async ({ task_id, round_index, step_index, step_name, status, state_snapshot, error_message }) => {
     const db = getDb();
@@ -709,10 +716,10 @@ server.tool(
   'steer',
   'Submit a steering event to redirect an active cascade.',
   {
-    cascade_id: z.string(),
+    cascade_id: z.string().max(MAX_ID),
     event_type: z.enum(['redirect', 'narrow', 'broaden', 'add_question', 'drop_hypothesis', 'approve', 'reject']),
-    instruction: z.string(),
-    target_id: z.string().optional().describe('ID of hypothesis or finding to target'),
+    instruction: z.string().max(MAX_QUESTION),
+    target_id: z.string().max(MAX_ID).optional().describe('ID of hypothesis or finding to target'),
   },
   async ({ cascade_id, event_type, instruction, target_id }) => {
     const db = getDb();
@@ -733,9 +740,9 @@ server.tool(
   'record_metric',
   'Record a metric value for tracking cascade health over time.',
   {
-    cascade_id: z.string(),
+    cascade_id: z.string().max(MAX_ID),
     round_index: z.number().optional(),
-    metric_name: z.string().describe('e.g., entropy, coverage, confidence_avg, pid_error, ncd_dedup_ratio'),
+    metric_name: z.string().max(MAX_SHORT).describe('e.g., entropy, coverage, confidence_avg, pid_error, ncd_dedup_ratio'),
     metric_value: z.number(),
   },
   async ({ cascade_id, round_index, metric_name, metric_value }) => {
@@ -756,11 +763,11 @@ server.tool(
   'create_note',
   'Create an atomic Zettelkasten note from an insight. Auto-links to related notes by keyword overlap. Content-addressable (idempotent).',
   {
-    content: z.string().describe('The atomic insight or observation'),
+    content: z.string().max(MAX_CLAIM).describe('The atomic insight or observation'),
     note_type: z.enum(['insight', 'connection', 'question', 'contradiction', 'synthesis']).optional().default('insight'),
-    keywords: z.array(z.string()).optional().default([]),
-    source_finding_id: z.string().optional(),
-    cascade_id: z.string().optional(),
+    keywords: z.array(z.string().max(MAX_SHORT)).max(20).optional().default([]),
+    source_finding_id: z.string().max(MAX_ID).optional(),
+    cascade_id: z.string().max(MAX_ID).optional(),
     cascade_round: z.number().optional(),
   },
   async ({ content, note_type, keywords, source_finding_id, cascade_id, cascade_round }) => {
@@ -802,8 +809,8 @@ server.tool(
   'search_notes',
   'Search atomic notes by keyword. Returns notes sorted by access frequency.',
   {
-    keyword: z.string(),
-    limit: z.number().optional().default(10),
+    keyword: z.string().max(MAX_SHORT),
+    limit: z.number().min(1).max(100).optional().default(10),
   },
   async ({ keyword, limit }) => {
     const notes = searchNotes(keyword, limit);
