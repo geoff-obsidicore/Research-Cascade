@@ -13,6 +13,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { getDb, closeDb, generateId, contentHash, withTransaction } from './db/index.js';
 import { ingestFinding } from './trust/ingestion.js';
+import { consolidateRound } from './memory/consolidation.js';
+import { checkInterventions, formatInterventions } from './hitl/interventions.js';
+import { renderDashboard, buildDashboardData } from './hitl/dashboard.js';
+import { createNote, linkNotes, extractNotesFromFinding, updateMaturity, getNoteStats, searchNotes } from './graph/amem.js';
 
 const server = new McpServer({
   name: 'cascade-engine',
@@ -452,12 +456,25 @@ server.tool(
         appliedSteers.push(`[${steer.event_type}] ${steer.instruction}`);
       }
 
+      // --- Phase 7 activation: check interventions ---
+      const interventions = checkInterventions(cascade_id);
+      const blockingInterventions = interventions.filter(i => i.level === 'blocking');
+      const advisoryInterventions = interventions.filter(i => i.level === 'advisory');
+
+      // Note stats
+      const noteCount = (db.prepare('SELECT COUNT(*) as n FROM atomic_notes WHERE cascade_id = ?').get(cascade_id) as any)?.n || 0;
+
       const status = {
         ...cascade,
         pid_state: cascade.pid_state_json ? JSON.parse(cascade.pid_state_json) : null,
         plan: cascade.plan_json ? JSON.parse(cascade.plan_json) : null,
-        counts: { findings: findingsCount, quarantined: quarantinedCount, hypotheses: hypothesesCount, threads: threadsCount, entities: entityCount, edges: edgeCount },
+        counts: { findings: findingsCount, quarantined: quarantinedCount, hypotheses: hypothesesCount, threads: threadsCount, entities: entityCount, edges: edgeCount, notes: noteCount },
         applied_steers: appliedSteers.length > 0 ? appliedSteers : undefined,
+        interventions: blockingInterventions.length > 0
+          ? { blocking: blockingInterventions.map(i => i.description), advisory: advisoryInterventions.map(i => i.description) }
+          : advisoryInterventions.length > 0
+            ? { advisory: advisoryInterventions.map(i => i.description) }
+            : undefined,
         exploration_budget: Math.max(0, 1 - cascade.current_round / cascade.max_rounds),
       };
 
@@ -520,8 +537,33 @@ server.tool(
     params.push(cascade_id);
     db.prepare(`UPDATE cascades SET ${updates.join(', ')} WHERE id = ?`).run(...params);
 
-    const updated = db.prepare('SELECT id, status, current_round, max_rounds, tokens_used, token_budget FROM cascades WHERE id = ?').get(cascade_id);
-    return { content: [{ type: 'text' as const, text: JSON.stringify(updated, null, 2) }] };
+    // --- Phase 6 activation: run consolidation when advancing rounds ---
+    let consolidationReport: string | undefined;
+    if (advance_round) {
+      try {
+        const result = consolidateRound(cascade_id, cascade.current_round);
+        // Extract notes from this round's findings
+        const roundFindings = db.prepare('SELECT id FROM findings WHERE cascade_id = ? AND cascade_round = ? AND quarantined = 0')
+          .all(cascade_id, cascade.current_round) as any[];
+        let notesCreated = 0;
+        for (const f of roundFindings) {
+          const noteIds = extractNotesFromFinding(f.id, cascade_id, cascade.current_round);
+          notesCreated += noteIds.length;
+        }
+        // Update note maturity
+        const maturityResult = updateMaturity();
+
+        consolidationReport = `Consolidation: dedup ${result.deduped.removed} removed, ${result.tierChanges.promoted} promoted, ${result.tierChanges.demoted} demoted, ${result.pruned.archived} pruned, ${result.scheduled} scheduled for SM-2. ${notesCreated} notes created, ${maturityResult.promoted} matured. (${result.durationMs}ms)`;
+      } catch (err: any) {
+        consolidationReport = `Consolidation error: ${err.message}`;
+      }
+    }
+
+    const updated = db.prepare('SELECT id, status, current_round, max_rounds, tokens_used, token_budget FROM cascades WHERE id = ?').get(cascade_id) as any;
+    const response: any = { ...updated };
+    if (consolidationReport) response.consolidation = consolidationReport;
+
+    return { content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }] };
   }
 );
 
@@ -578,6 +620,17 @@ server.tool(
     const recentMetrics = db.prepare(`SELECT metric_name, metric_value, recorded_at FROM metrics
       WHERE cascade_id = ? ORDER BY recorded_at DESC LIMIT 20`).all(cascade_id);
 
+    // Note stats
+    const noteStats = getNoteStats();
+
+    // Consolidation history
+    const lastConsolidation = db.prepare(`SELECT * FROM consolidation_log
+      WHERE cascade_id = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(cascade_id) as any;
+
+    // SM-2 review stats
+    const sm2Due = (db.prepare("SELECT COUNT(*) as n FROM sm2_schedule WHERE next_review <= datetime('now')").get() as any).n;
+
     const dashboard = {
       cascade: { id: cascade_id, status: cascade.status, round: cascade.current_round, maxRounds: cascade.max_rounds },
       quality: {
@@ -590,10 +643,26 @@ server.tool(
       },
       hypotheses: hypStats,
       graph: { entities: entityCount, edges: edgeCount, avgDegree: Math.round(avgDegree * 100) / 100 },
+      notes: noteStats,
+      memory: {
+        lastConsolidation: lastConsolidation ? {
+          promoted: lastConsolidation.items_promoted,
+          demoted: lastConsolidation.items_demoted,
+          pruned: lastConsolidation.items_pruned,
+          durationMs: lastConsolidation.duration_ms,
+        } : null,
+        sm2ItemsDue: sm2Due,
+      },
       tokens: { used: cascade.tokens_used, budget: cascade.token_budget, remaining: cascade.token_budget - cascade.tokens_used },
       explorationBudget: Math.max(0, 1 - cascade.current_round / cascade.max_rounds),
       recentMetrics,
     };
+
+    // --- Phase 7 activation: render ANSI dashboard to stderr ---
+    const dashData = buildDashboardData(cascade_id);
+    if (dashData) {
+      console.error(renderDashboard(dashData));
+    }
 
     return { content: [{ type: 'text' as const, text: JSON.stringify(dashboard, null, 2) }] };
   }
@@ -677,6 +746,68 @@ server.tool(
     return {
       content: [{ type: 'text' as const, text: `Metric recorded: ${metric_name} = ${metric_value}` }],
     };
+  }
+);
+
+// ============================================================
+// TOOL 16: create_note — A-MEM atomic note creation
+// ============================================================
+server.tool(
+  'create_note',
+  'Create an atomic Zettelkasten note from an insight. Auto-links to related notes by keyword overlap. Content-addressable (idempotent).',
+  {
+    content: z.string().describe('The atomic insight or observation'),
+    note_type: z.enum(['insight', 'connection', 'question', 'contradiction', 'synthesis']).optional().default('insight'),
+    keywords: z.array(z.string()).optional().default([]),
+    source_finding_id: z.string().optional(),
+    cascade_id: z.string().optional(),
+    cascade_round: z.number().optional(),
+  },
+  async ({ content, note_type, keywords, source_finding_id, cascade_id, cascade_round }) => {
+    const noteId = createNote(content, note_type, keywords, source_finding_id, undefined, cascade_id, cascade_round);
+
+    // Auto-link to related notes
+    if (cascade_id) {
+      const db = getDb();
+      const existing = db.prepare(`SELECT id, content FROM atomic_notes WHERE id != ? AND cascade_id = ? LIMIT 50`)
+        .all(noteId, cascade_id) as any[];
+
+      let linksCreated = 0;
+      const contentWords = new Set(content.toLowerCase().split(/\s+/).filter(w => w.length > 5));
+      for (const other of existing) {
+        const otherWords = new Set(other.content.toLowerCase().split(/\s+/).filter((w: string) => w.length > 5));
+        let overlap = 0;
+        for (const w of contentWords) { if (otherWords.has(w)) overlap++; }
+        if (overlap >= 2) {
+          linkNotes(noteId, other.id, 'relates_to', Math.min(1.0, overlap * 0.2));
+          linksCreated++;
+        }
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: `Note ${noteId}: "${content.slice(0, 60)}..." (${note_type}, ${linksCreated} auto-links)` }],
+      };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Note ${noteId}: "${content.slice(0, 60)}..." (${note_type})` }],
+    };
+  }
+);
+
+// ============================================================
+// TOOL 17: search_notes — Search Zettelkasten notes
+// ============================================================
+server.tool(
+  'search_notes',
+  'Search atomic notes by keyword. Returns notes sorted by access frequency.',
+  {
+    keyword: z.string(),
+    limit: z.number().optional().default(10),
+  },
+  async ({ keyword, limit }) => {
+    const notes = searchNotes(keyword, limit);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(notes, null, 2) }] };
   }
 );
 

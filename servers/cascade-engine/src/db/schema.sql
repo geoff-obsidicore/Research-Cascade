@@ -169,6 +169,41 @@ CREATE INDEX IF NOT EXISTS idx_hypotheses_cascade ON hypotheses(cascade_id);
 CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
 
 -- ============================================================
+-- TIER 2b: A-MEM ZETTELKASTEN LAYER
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS atomic_notes (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  note_type TEXT NOT NULL DEFAULT 'insight'
+    CHECK(note_type IN('insight','connection','question','contradiction','synthesis')),
+  source_finding_id TEXT REFERENCES findings(id),
+  source_entity_id INTEGER REFERENCES kg_entities(id),
+  cascade_id TEXT REFERENCES cascades(id) ON DELETE CASCADE,
+  cascade_round INTEGER,
+  keywords TEXT DEFAULT '[]',
+  maturity TEXT DEFAULT 'isolated_fact'
+    CHECK(maturity IN('isolated_fact','connected_fact','principle','mental_model')),
+  access_count INTEGER DEFAULT 0,
+  last_accessed TEXT DEFAULT(datetime('now')),
+  created_at TEXT DEFAULT(datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS note_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_note_id TEXT NOT NULL REFERENCES atomic_notes(id) ON DELETE CASCADE,
+  target_note_id TEXT NOT NULL REFERENCES atomic_notes(id) ON DELETE CASCADE,
+  link_type TEXT NOT NULL DEFAULT 'relates_to'
+    CHECK(link_type IN('relates_to','supports','contradicts','refines','generalizes','exemplifies')),
+  strength REAL DEFAULT 1.0,
+  bidirectional INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT(datetime('now')),
+  UNIQUE(source_note_id, target_note_id, link_type)
+);
+CREATE INDEX IF NOT EXISTS idx_note_links_source ON note_links(source_note_id);
+CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
+
+-- ============================================================
 -- TIER 3: TRUST & ANALYTICS
 -- ============================================================
 
