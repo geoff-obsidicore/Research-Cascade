@@ -6,30 +6,57 @@ Progressive deep research engine with knowledge graph, trust scoring, and self-r
 
 ## Quick Start
 
+### Option A: npm install (recommended)
+
 ```bash
-# Clone and build
+npm install -g @obsidicore/cascade-engine
+```
+
+Add to your `.mcp.json` (Claude Code) or equivalent MCP config:
+
+```json
+{
+  "mcpServers": {
+    "cascade-engine": {
+      "command": "cascade-engine",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Start a Claude Code session and all 17 tools are available.
+
+### Option B: From source
+
+```bash
 git clone https://github.com/geoff-obsidicore/Research-Cascade.git
 cd Research-Cascade/servers/cascade-engine
-npm install
-npm run build
-cp src/db/schema.sql dist/db/schema.sql
-
-# Run tests (78 tests, all passing)
-npm test
+npm install && npm run build
+npm test  # 78 tests, all passing
 ```
 
-The `.mcp.json` in the project root registers the server automatically. Start a Claude Code session from the project directory and all 15 tools are available:
+The `.mcp.json` in the project root auto-registers the server for development.
 
-```bash
-cd Research-Cascade
-claude
-```
+### Run a cascade
 
-Then tell Claude to run a cascade:
+Tell your MCP client (Claude Code, OpenClaw, etc.):
 
 ```
 Use cascade_init to start researching "your question here",
 then store_plan with sub-questions, and run the full cascade loop.
+```
+
+### CLI commands
+
+```bash
+cascade-engine serve          # Start MCP server (default)
+cascade-engine status         # Show active cascades
+cascade-engine status <id>    # Detailed cascade status
+cascade-engine graph          # Knowledge graph stats
+cascade-engine notes          # Zettelkasten note stats
+cascade-engine db-path        # Print database location
+cascade-engine reset          # Delete database, start fresh
 ```
 
 The knowledge graph persists in `~/.cascade-engine/knowledge.db` — it survives context compaction, session restarts, and `/clear`.
@@ -67,7 +94,7 @@ Each round narrows scope while deepening understanding. The exploration budget d
 │           MCP Server (stdio)                │
 │                                             │
 │  ┌──────────┐  ┌──────────┐  ┌───────────┐ │
-│  │ 15 Tools │  │ SQLite   │  │ Trust     │ │
+│  │ 17 Tools │  │ SQLite   │  │ Trust     │ │
 │  │          │  │ WAL DB   │  │ Scoring   │ │
 │  └──────────┘  └──────────┘  └───────────┘ │
 │                                             │
@@ -119,6 +146,8 @@ servers/cascade-engine/src/
 | `store_checkpoint` | Step-level crash recovery |
 | `steer` | Redirect active research (narrow/broaden/add question) |
 | `record_metric` | Track metric values over time |
+| `create_note` | Create Zettelkasten atomic note with auto-linking |
+| `search_notes` | Search notes by keyword |
 
 ## Trust Scoring
 

@@ -814,7 +814,7 @@ server.tool(
 // ============================================================
 // Server startup
 // ============================================================
-async function main(): Promise<void> {
+export async function startServer(): Promise<void> {
   // Initialize DB on startup to catch schema errors early
   try {
     getDb();
@@ -829,8 +829,14 @@ async function main(): Promise<void> {
   console.error('[cascade-engine] MCP server running on stdio');
 }
 
-main().catch((err) => {
-  console.error('[cascade-engine] Fatal:', err);
-  closeDb();
-  process.exit(1);
-});
+// Direct execution (node dist/index.js)
+const isDirectRun = process.argv[1]?.endsWith('index.js');
+if (isDirectRun) {
+  startServer().catch((err) => {
+    console.error('[cascade-engine] Fatal:', err);
+    closeDb();
+    process.exit(1);
+  });
+}
+
+export default startServer;

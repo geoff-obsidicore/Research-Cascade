@@ -1,16 +1,28 @@
 {
   "name": "@obsidicore/cascade-engine",
-  "version": "0.1.0",
-  "description": "Research Cascade MCP server — progressive memory & self-improvement engine",
+  "version": "0.2.0",
+  "description": "Progressive deep research engine with knowledge graph, trust scoring, and self-regulation. MCP server for Claude Code, OpenClaw, or any MCP client.",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "cascade-engine": "dist/cli.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.js.map",
+    "dist/db/schema.sql",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').copyFileSync('src/db/schema.sql','dist/db/schema.sql')\"",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -25,5 +37,22 @@
   },
   "engines": {
     "node": ">=22.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geoff-obsidicore/Research-Cascade.git"
+  },
+  "keywords": [
+    "mcp",
+    "research",
+    "knowledge-graph",
+    "ai-agent",
+    "memory",
+    "sqlite",
+    "cascade",
+    "trust-scoring",
+    "self-regulation"
+  ],
+  "author": "Obsidicore",
+  "license": "MIT"
 }
