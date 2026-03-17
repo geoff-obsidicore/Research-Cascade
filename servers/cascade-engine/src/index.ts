@@ -12,6 +12,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { getDb, closeDb, generateId, contentHash, withTransaction } from './db/index.js';
+import { ingestFinding } from './trust/ingestion.js';
 
 const server = new McpServer({
   name: 'cascade-engine',
@@ -76,28 +77,17 @@ server.tool(
     cascade_round: z.number(),
   },
   async ({ cascade_id, thread_id, claim, evidence, source_url, source_type, confidence, cascade_round }) => {
-    const db = getDb();
-    const id = contentHash(claim);
+    // Route through full trust scoring pipeline
+    const result = ingestFinding(
+      cascade_id, claim, evidence, source_url, source_type,
+      confidence, cascade_round, thread_id,
+    );
 
-    // Check for duplicate via content hash
-    const existing = db.prepare('SELECT id FROM findings WHERE id = ?').get(id) as any;
-    if (existing) {
-      // Idempotent upsert — update confidence if new evidence
-      db.prepare(`UPDATE findings SET
-        confidence = MAX(confidence, ?),
-        evidence = COALESCE(?, evidence),
-        updated_at = datetime('now')
-        WHERE id = ?`).run(confidence, evidence, id);
-      return { content: [{ type: 'text' as const, text: `Finding ${id} already exists — updated confidence.` }] };
-    }
-
-    db.prepare(`INSERT INTO findings (id, thread_id, cascade_id, claim, evidence, source_url, source_type, confidence, cascade_round)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, thread_id, cascade_id, claim, evidence, source_url, source_type, confidence, cascade_round);
-
-    // Auto-index in FTS (handled by trigger)
+    const statusIcon = result.action === 'admitted' ? 'ADMITTED' :
+      result.action === 'quarantined' ? 'QUARANTINED' : 'REJECTED';
 
     return {
-      content: [{ type: 'text' as const, text: `Finding stored: ${id} (confidence: ${confidence}, round: ${cascade_round})` }],
+      content: [{ type: 'text' as const, text: `Finding ${result.findingId}: ${statusIcon} (trust: ${result.trustScore.toFixed(3)}, confidence: ${confidence})\nSignals: source=${result.signals.sourceReputation.toFixed(2)} corroboration=${result.signals.crossCorroboration.toFixed(2)} instruction=${result.signals.instructionScore.toFixed(2)} grade=${result.signals.gradeAssessment.toFixed(2)}\nReason: ${result.reason}` }],
     };
   }
 );
@@ -229,15 +219,16 @@ server.tool(
 // ============================================================
 server.tool(
   'query_graph',
-  'Traverse the knowledge graph from a starting entity. Uses recursive CTE, bounded to 3 hops max.',
+  'Traverse the knowledge graph from a starting entity. Uses recursive CTE, bounded to 3 hops max. Follows edges in both directions by default.',
   {
     start_name: z.string(),
     start_type: z.string(),
     max_hops: z.number().min(1).max(3).optional().default(2),
+    direction: z.enum(['outgoing', 'incoming', 'both']).optional().default('both').describe('Edge direction to follow'),
     relation_filter: z.string().optional().describe('Filter edges by relation type'),
     min_weight: z.number().min(0).max(1).optional().default(0.0),
   },
-  async ({ start_name, start_type, max_hops, relation_filter, min_weight }) => {
+  async ({ start_name, start_type, max_hops, direction, relation_filter, min_weight }) => {
     const db = getDb();
 
     const start = db.prepare('SELECT id FROM kg_entities WHERE name = ? AND entity_type = ?')
@@ -245,25 +236,63 @@ server.tool(
     if (!start) return { content: [{ type: 'text' as const, text: `Entity "${start_name}" (${start_type}) not found.` }] };
 
     let relationClause = '';
-    const params: any[] = [start.id, min_weight];
-
     if (relation_filter) {
-      relationClause = 'AND e.relation_type = ?';
-      params.push(relation_filter);
+      relationClause = `AND e.relation_type = '${relation_filter.replace(/'/g, "''")}'`;
     }
 
-    // Always push max_hops for the WHERE clause
-    params.push(max_hops);
-
-    const sql = `
-      WITH RECURSIVE traverse(entity_id, depth, path) AS (
-        SELECT ?, 0, CAST(? AS TEXT)
-        UNION ALL
+    // Build directional join clauses
+    let edgeJoins: string;
+    if (direction === 'outgoing') {
+      edgeJoins = `
         SELECT e.target_id, t.depth + 1,
-          t.path || ' -> ' || (SELECT name FROM kg_entities WHERE id = e.target_id)
+          t.path || ' -[' || e.relation_type || ']-> ' || tgt.name,
+          t.visited || ',' || CAST(e.target_id AS TEXT)
         FROM traverse t
         JOIN kg_edges e ON e.source_id = t.entity_id
-        WHERE t.depth < ? AND e.weight >= ? ${relationClause}
+        JOIN kg_entities tgt ON tgt.id = e.target_id
+        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
+          AND t.visited NOT LIKE '%,' || CAST(e.target_id AS TEXT) || ',%'
+          ${relationClause}`;
+    } else if (direction === 'incoming') {
+      edgeJoins = `
+        SELECT e.source_id, t.depth + 1,
+          t.path || ' <-[' || e.relation_type || ']- ' || src.name,
+          t.visited || ',' || CAST(e.source_id AS TEXT)
+        FROM traverse t
+        JOIN kg_edges e ON e.target_id = t.entity_id
+        JOIN kg_entities src ON src.id = e.source_id
+        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
+          AND t.visited NOT LIKE '%,' || CAST(e.source_id AS TEXT) || ',%'
+          ${relationClause}`;
+    } else {
+      // both directions
+      edgeJoins = `
+        SELECT e.target_id, t.depth + 1,
+          t.path || ' -[' || e.relation_type || ']-> ' || tgt.name,
+          t.visited || ',' || CAST(e.target_id AS TEXT)
+        FROM traverse t
+        JOIN kg_edges e ON e.source_id = t.entity_id
+        JOIN kg_entities tgt ON tgt.id = e.target_id
+        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
+          AND t.visited NOT LIKE '%,' || CAST(e.target_id AS TEXT) || ',%'
+          ${relationClause}
+        UNION ALL
+        SELECT e.source_id, t.depth + 1,
+          t.path || ' <-[' || e.relation_type || ']- ' || src.name,
+          t.visited || ',' || CAST(e.source_id AS TEXT)
+        FROM traverse t
+        JOIN kg_edges e ON e.target_id = t.entity_id
+        JOIN kg_entities src ON src.id = e.source_id
+        WHERE t.depth < ${max_hops} AND e.weight >= ${min_weight}
+          AND t.visited NOT LIKE '%,' || CAST(e.source_id AS TEXT) || ',%'
+          ${relationClause}`;
+    }
+
+    const sql = `
+      WITH RECURSIVE traverse(entity_id, depth, path, visited) AS (
+        SELECT ${start.id}, 0, '${start_name.replace(/'/g, "''")}', ',${start.id},'
+        UNION ALL
+        ${edgeJoins}
       )
       SELECT DISTINCT
         ent.id, ent.name, ent.entity_type, ent.tier,
@@ -274,15 +303,11 @@ server.tool(
       WHERE t.depth > 0
       ORDER BY t.depth, ent.importance DESC`;
 
-    // Reorder params: start.id, start.id (as path seed), max_hops, min_weight, [relation_filter]
-    const queryParams = [start.id, start_name, max_hops, min_weight];
-    if (relation_filter) queryParams.push(relation_filter);
+    const results = db.prepare(sql).all();
 
-    const results = db.prepare(sql).all(...queryParams);
-
-    // Also update activation counts for traversed edges
+    // Update activation counts for traversed edges
     db.prepare(`UPDATE kg_edges SET activation_count = activation_count + 1, last_activated = datetime('now')
-      WHERE source_id = ?`).run(start.id);
+      WHERE source_id = ? OR target_id = ?`).run(start.id, start.id);
 
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }],

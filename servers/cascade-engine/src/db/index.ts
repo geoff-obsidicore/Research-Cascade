@@ -5,10 +5,11 @@
  */
 
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, existsSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -109,7 +110,7 @@ export function checkpointIfNeeded(thresholdMB: number = 50): void {
   const db = getDb();
   const walPath = db.name + '-wal';
   try {
-    const { size } = require('node:fs').statSync(walPath);
+    const { size } = statSync(walPath);
     if (size > thresholdMB * 1024 * 1024) {
       db.pragma('wal_checkpoint(PASSIVE)');
     }
@@ -122,13 +123,11 @@ export function checkpointIfNeeded(thresholdMB: number = 50): void {
 
 /** Generate a content-addressable ID from claim text */
 export function contentHash(text: string): string {
-  const { createHash } = require('node:crypto');
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 /** Generate a random UUID-like ID */
 export function generateId(): string {
-  const { randomBytes } = require('node:crypto');
   return randomBytes(8).toString('hex');
 }
 

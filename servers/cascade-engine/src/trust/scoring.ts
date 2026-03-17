@@ -28,6 +28,7 @@ export interface TrustResult {
   composite: number;
   signals: TrustSignals;
   action: 'admit' | 'quarantine' | 'reject';
+  gradeLevel: 'high' | 'moderate' | 'low' | 'very_low';
   reason: string;
   isNovel: boolean;
 }
@@ -98,7 +99,12 @@ export function scoreTrust(
     }
   }
 
-  return { composite, signals, action, reason, isNovel };
+  // GRADE evidence assessment
+  // Based on PRISMA/GRADE framework: 5 downgrade factors, 3 upgrade factors
+  // Simplified: composite of source quality, corroboration, and precision
+  const gradeLevel = computeGradeLevel(signals, sourceType);
+
+  return { composite, signals, action, gradeLevel, reason, isNovel };
 }
 
 /**
@@ -185,6 +191,37 @@ function scoreGradeProxy(sourceType: string | undefined): number {
     case 'tertiary': return 0.4;  // Forum posts, social media
     default: return 0.5;
   }
+}
+
+/**
+ * Compute GRADE evidence level from trust signals.
+ *
+ * GRADE framework (simplified):
+ * Start at HIGH if primary source, MODERATE if secondary, LOW if tertiary.
+ * Downgrade for: low reputation, low corroboration, instruction patterns, low precision.
+ * Upgrade for: high corroboration (≥3 sources), high source reputation, dose-response (multiple signals agree).
+ */
+function computeGradeLevel(
+  signals: TrustSignals,
+  sourceType: string | undefined,
+): TrustResult['gradeLevel'] {
+  // Start level based on source type
+  let level = sourceType === 'primary' ? 3 : sourceType === 'secondary' ? 2 : sourceType === 'tertiary' ? 1 : 2;
+
+  // Downgrade factors (GRADE: 5 domains)
+  if (signals.sourceReputation < 0.4) level--;           // Risk of bias
+  if (signals.crossCorroboration < 0.4) level--;          // Inconsistency (not independently confirmed)
+  if (signals.instructionScore < 0.8) level--;             // Imprecision (suspicious content)
+  if (signals.gradeAssessment < 0.5) level--;              // Indirectness
+
+  // Upgrade factors (GRADE: 3 domains)
+  if (signals.crossCorroboration > 0.7) level++;           // Large effect (strong corroboration)
+  if (signals.sourceReputation > 0.8) level++;             // Dose-response (trusted + confirmed)
+
+  // Clamp and map
+  level = Math.max(0, Math.min(3, level));
+  const grades: TrustResult['gradeLevel'][] = ['very_low', 'low', 'moderate', 'high'];
+  return grades[level];
 }
 
 /**

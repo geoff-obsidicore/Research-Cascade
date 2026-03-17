@@ -1,9 +1,11 @@
 {
   "mcpServers": {
     "cascade-engine": {
-      "command": "cmd",
-      "args": ["/c", "node", "servers/cascade-engine/dist/index.js"],
-      "env": {}
+      "command": "node",
+      "args": ["servers/cascade-engine/dist/index.js"],
+      "env": {
+        "NODE_ENV": "production"
+      }
     }
   }
 }

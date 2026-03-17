@@ -75,19 +75,21 @@ export function ingestFinding(
   if (action !== 'rejected') {
     db.prepare(`INSERT INTO findings
       (id, thread_id, cascade_id, claim, evidence, source_url, source_type,
-       confidence, trust_composite, trust_signals_json, quarantined,
+       confidence, trust_composite, trust_signals_json, grade_level, quarantined,
        retrieval_weight, cascade_round)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         confidence = MAX(confidence, excluded.confidence),
         trust_composite = excluded.trust_composite,
         trust_signals_json = excluded.trust_signals_json,
+        grade_level = excluded.grade_level,
         quarantined = MIN(quarantined, excluded.quarantined)`)
       .run(
         findingId, threadId, cascadeId,
         sanitizedClaim, sanitizedEvidence, sourceUrl, sourceType,
         rawConfidence, trustResult.composite,
         JSON.stringify(trustResult.signals),
+        trustResult.gradeLevel,
         quarantined, retrievalWeight, cascadeRound,
       );
   }
