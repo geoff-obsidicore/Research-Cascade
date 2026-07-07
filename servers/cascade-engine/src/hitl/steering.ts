@@ -109,8 +109,14 @@ export function applySteer(eventId: number): string {
 
     case 'reject':
       if (event.target_id) {
-        db.prepare('DELETE FROM findings WHERE id = ?').run(event.target_id);
-        result = `Rejected and removed finding ${event.target_id}`;
+        // Soft-delete tombstone (AFR-12/AFR-16): reversible and auditable,
+        // never a hard DELETE. Hidden from retrieval (quarantined, weight 0)
+        // but recoverable by clearing `rejected`.
+        db.prepare(
+          `UPDATE findings SET rejected = 1, quarantined = 1, human_reviewed = 1, retrieval_weight = 0
+           WHERE id = ?`,
+        ).run(event.target_id);
+        result = `Rejected finding ${event.target_id} (tombstoned — recoverable, not destroyed)`;
       } else {
         result = 'No target finding specified.';
       }

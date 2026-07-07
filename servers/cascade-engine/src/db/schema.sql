@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS findings (
   grade_level TEXT CHECK(grade_level IS NULL OR grade_level IN('high','moderate','low','very_low')),
   quarantined INTEGER DEFAULT 0,
   human_reviewed INTEGER DEFAULT 0,
+  rejected INTEGER DEFAULT 0,          -- soft-delete tombstone (AFR-12/AFR-16): reversible, preserves audit
   retrieval_weight REAL DEFAULT 1.0,
   cd47_protected INTEGER DEFAULT 0,
   cascade_round INTEGER NOT NULL,
@@ -280,3 +281,20 @@ CREATE TABLE IF NOT EXISTS steer_events (
   created_at TEXT DEFAULT(datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_steer_cascade ON steer_events(cascade_id, applied);
+
+-- ============================================================
+-- TIER 6: OPERATIONAL SAFETY (AFR hardening)
+-- ============================================================
+
+-- Behaviour audit trail (AFR-16): every tool invocation, replayable.
+-- Complements ingestion_audit_log (which records finding-content decisions).
+CREATE TABLE IF NOT EXISTS action_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tool TEXT NOT NULL,
+  consequence TEXT CHECK(consequence IN('low','high','critical')),
+  cascade_id TEXT,
+  status TEXT NOT NULL CHECK(status IN('ok','error','blocked')),
+  detail TEXT,
+  created_at TEXT DEFAULT(datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_action_log_cascade ON action_log(cascade_id, id);

@@ -96,6 +96,19 @@ function migrateSchema(db: Database.Database): void {
   // Split on semicolons, filter empty, execute each statement
   // All CREATE statements use IF NOT EXISTS — safe to re-run
   db.exec(schema);
+
+  // Additive column migrations for databases created before a column existed.
+  // CREATE TABLE IF NOT EXISTS never alters an existing table, so new columns
+  // must be added explicitly and idempotently.
+  ensureColumn(db, 'findings', 'rejected', 'INTEGER DEFAULT 0');
+}
+
+/** Add a column if the table lacks it. Idempotent and safe to re-run. */
+function ensureColumn(db: Database.Database, table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
 }
 
 export function closeDb(): void {

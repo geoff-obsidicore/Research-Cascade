@@ -1,11 +1,18 @@
 /**
- * HITL Intervention Taxonomy
+ * HITL Intervention Taxonomy — the rules actually implemented below.
  *
- * BLOCKING: Round 0 hypothesis (always), hypothesis drift >0.6, round boundaries (15min timeout)
- * ADVISORY: trust <0.4 (2min), circuit breaker open (1min), confidence <0.5 (3min)
- * SILENT: search planning (log only)
+ * BLOCKING (needs a human before research continues):
+ *   - initial_hypothesis : Round 0 hypotheses awaiting approval
+ *   - hypothesis_drift   : affinity moved > 0.6 from origin
+ *   - budget_overrun     : tokens_used >= token_budget (AFR-17 spend anomaly)
+ *   - quarantine_spike   : > 50% of findings quarantined (AFR-17 poisoning signal)
+ * ADVISORY (surface, but auto-proceed after timeout):
+ *   - low_trust          : findings with trust < 0.4
+ *   - low_confidence     : average confidence < 0.5
  *
- * Each intervention point has a timeout — if no human response, auto-proceeds.
+ * The budget/quarantine rules are the real-time operational anomaly alerts
+ * (AFR-17): they are DB-backed, so they persist across the stateless MCP calls
+ * and surface in `get_status`, unlike an in-process counter.
  */
 
 import { getDb } from '../db/index.js';
@@ -116,6 +123,52 @@ const RULES: InterventionRule[] = [
         triggered: true,
         description: `Average confidence is ${(avgConf * 100).toFixed(1)}% — below 50% threshold.`,
         context: { avgConfidence: avgConf },
+      };
+    },
+  },
+
+  // BLOCKING: Spend anomaly — token budget reached or exceeded (AFR-17)
+  {
+    category: 'budget_overrun',
+    level: 'blocking',
+    timeoutMinutes: 0,
+    check: (cascadeId, _ctx) => {
+      const db = getDb();
+      const c = db.prepare('SELECT tokens_used, token_budget FROM cascades WHERE id = ?').get(cascadeId) as any;
+      if (!c || !c.token_budget || c.tokens_used < c.token_budget) {
+        return { triggered: false, description: '', context: {} };
+      }
+      return {
+        triggered: true,
+        description: `Token budget reached: ${c.tokens_used}/${c.token_budget}. Halt or raise the budget before continuing.`,
+        context: { tokensUsed: c.tokens_used, tokenBudget: c.token_budget },
+      };
+    },
+  },
+
+  // BLOCKING: Poisoning signal — quarantine rate spike (AFR-17)
+  {
+    category: 'quarantine_spike',
+    level: 'blocking',
+    timeoutMinutes: 0,
+    check: (cascadeId, _ctx) => {
+      const db = getDb();
+      const row = db.prepare(`SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN quarantined = 1 THEN 1 ELSE 0 END) as quarantined
+        FROM findings WHERE cascade_id = ?`).get(cascadeId) as any;
+
+      const total = row?.total ?? 0;
+      const quarantined = row?.quarantined ?? 0;
+      // Need a minimum sample so one bad finding doesn't trip it.
+      if (total < 5) return { triggered: false, description: '', context: {} };
+      const rate = quarantined / total;
+      if (rate <= 0.5) return { triggered: false, description: '', context: {} };
+
+      return {
+        triggered: true,
+        description: `${Math.round(rate * 100)}% of findings quarantined (${quarantined}/${total}) — possible source poisoning. Review before continuing.`,
+        context: { quarantined, total, rate },
       };
     },
   },

@@ -8,17 +8,25 @@
  *   cascade-engine status <id>    Show detailed cascade status
  *   cascade-engine graph          Show knowledge graph stats
  *   cascade-engine notes          Show Zettelkasten note stats
+ *   cascade-engine actions [id]   Show the tool-action audit log (AFR-16)
+ *   cascade-engine halt [reason]  Engage the kill-switch (AFR-20)
+ *   cascade-engine resume         Release the kill-switch
+ *   cascade-engine abort <id>     Stall one cascade (refuse further writes)
  *   cascade-engine reset          Delete the database and start fresh
  *   cascade-engine db-path        Print the database file path
  *   cascade-engine help           Show this help
  *
  * Environment:
  *   CASCADE_DB_PATH   Override database location (default: ~/.cascade-engine/knowledge.db)
+ *   CASCADE_HALT      Set to 1 to halt the engine (kill-switch, AFR-20)
+ *   CASCADE_HALT_FILE Override the HALT sentinel path (default: next to the DB)
  */
 
 import { getDb, closeDb } from './db/index.js';
 import { getGraphStats } from './graph/entities.js';
 import { getNoteStats } from './graph/amem.js';
+import { halt, resume } from './safety/killswitch.js';
+import { getRecentActions } from './safety/audit.js';
 import { existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -127,6 +135,61 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'halt': {
+      const reason = args.slice(1).join(' ') || 'manual halt via CLI';
+      const path = halt(reason);
+      console.log('Kill-switch ENGAGED (AFR-20). Every tool call is refused until you resume.');
+      console.log(`  Sentinel: ${path}`);
+      console.log(`  Reason:   ${reason}`);
+      console.log('Release with: cascade-engine resume');
+      break;
+    }
+
+    case 'resume': {
+      const cleared = resume();
+      console.log(cleared
+        ? 'Kill-switch released. Tool calls resume.'
+        : 'Kill-switch was not engaged (no HALT sentinel found).');
+      break;
+    }
+
+    case 'abort': {
+      const id = args[1];
+      if (!id) {
+        console.error('Usage: cascade-engine abort <cascade-id>');
+        process.exit(1);
+      }
+      const db = getDb();
+      const cascade = db.prepare('SELECT id, status FROM cascades WHERE id = ? OR id LIKE ?')
+        .get(id, `${id}%`) as any;
+      if (!cascade) {
+        console.log(`Cascade "${id}" not found.`);
+        closeDb();
+        break;
+      }
+      db.prepare("UPDATE cascades SET status = 'stalled', updated_at = datetime('now') WHERE id = ?")
+        .run(cascade.id);
+      console.log(`Aborted cascade ${cascade.id} — status set to 'stalled'. Writes are refused until you restore it (update_status).`);
+      closeDb();
+      break;
+    }
+
+    case 'actions': {
+      const id = args[1];
+      const rows = getRecentActions(50, id);
+      if (rows.length === 0) {
+        console.log('No actions logged yet.');
+        closeDb();
+        break;
+      }
+      console.log(`Last ${rows.length} action(s)${id ? ` for ${id}` : ''}:\n`);
+      for (const r of rows) {
+        console.log(`  ${r.created_at}  ${String(r.status).padEnd(7)} ${String(r.consequence || 'low').padEnd(8)} ${r.tool}${r.detail ? '  — ' + r.detail : ''}`);
+      }
+      closeDb();
+      break;
+    }
+
     case 'help':
     case '--help':
     case '-h': {
@@ -138,6 +201,10 @@ Usage:
   cascade-engine status <id>    Detailed cascade status
   cascade-engine graph          Knowledge graph statistics
   cascade-engine notes          Zettelkasten note statistics
+  cascade-engine actions [id]   Show the recent tool-action audit log (AFR-16)
+  cascade-engine halt [reason]  Engage the kill-switch — refuse all tool calls (AFR-20)
+  cascade-engine resume         Release the kill-switch
+  cascade-engine abort <id>     Stall one cascade — refuse further writes to it
   cascade-engine db-path        Print database file path
   cascade-engine reset          Delete database and start fresh
   cascade-engine help           Show this help

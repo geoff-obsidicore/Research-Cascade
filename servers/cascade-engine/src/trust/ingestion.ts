@@ -131,10 +131,14 @@ export function reviewQuarantined(findingId: string, approved: boolean): void {
 
   if (approved) {
     db.prepare(`UPDATE findings SET
-      quarantined = 0, human_reviewed = 1, retrieval_weight = 1.0
+      quarantined = 0, human_reviewed = 1, rejected = 0, retrieval_weight = 1.0
       WHERE id = ?`).run(findingId);
   } else {
-    db.prepare('DELETE FROM findings WHERE id = ?').run(findingId);
+    // Soft-delete tombstone (AFR-12/AFR-16): reversible and auditable, not a
+    // hard DELETE. The claim survives for review; retrieval is disabled.
+    db.prepare(`UPDATE findings SET
+      rejected = 1, quarantined = 1, human_reviewed = 1, retrieval_weight = 0
+      WHERE id = ?`).run(findingId);
   }
 
   // Log the decision

@@ -17,6 +17,10 @@ import { consolidateRound } from './memory/consolidation.js';
 import { checkInterventions, formatInterventions } from './hitl/interventions.js';
 import { renderDashboard, buildDashboardData } from './hitl/dashboard.js';
 import { createNote, linkNotes, extractNotesFromFinding, updateMaturity, getNoteStats, searchNotes } from './graph/amem.js';
+import { isHalted } from './safety/killswitch.js';
+import { logAction, getRecentActions } from './safety/audit.js';
+import { steerAutoApplies } from './safety/policy.js';
+import { applySteer } from './hitl/steering.js';
 
 // --- Input length limits (security) ---
 const MAX_ID = 100;
@@ -32,9 +36,56 @@ const server = new McpServer({
 });
 
 // ============================================================
+// Operational-safety guard (AFR-12 / AFR-16 / AFR-20)
+// Every tool is registered through `regTool`, which — before the handler runs —
+// refuses while the kill-switch is engaged, refuses writes to an aborted
+// (stalled) cascade, and records the call to the action_log afterward. No
+// handler can bypass this; it is the one place all 17+ tools funnel through.
+// ============================================================
+const mcpTool = (server.tool as any).bind(server);
+
+const MUTATING_TOOLS = new Set([
+  'store_plan', 'store_finding', 'add_entity', 'add_link', 'store_hypothesis',
+  'update_status', 'store_checkpoint', 'steer', 'apply_steer', 'record_metric', 'create_note',
+]);
+
+function guard(name: string, handler: (args: any) => Promise<any>): (args: any) => Promise<any> {
+  return async (args: any) => {
+    const cascadeId = args?.cascade_id;
+
+    const halt = isHalted();
+    if (halt.halted) {
+      logAction(name, 'blocked', { cascadeId, detail: `halted: ${halt.reason}` });
+      return { content: [{ type: 'text' as const, text: `Engine halted (${halt.reason}). No tool runs until a human clears the kill-switch — "cascade-engine resume" (AFR-20).` }] };
+    }
+
+    if (MUTATING_TOOLS.has(name) && cascadeId) {
+      const c = getDb().prepare('SELECT status FROM cascades WHERE id = ?').get(cascadeId) as any;
+      if (c && c.status === 'stalled') {
+        logAction(name, 'blocked', { cascadeId, detail: 'cascade aborted (stalled)' });
+        return { content: [{ type: 'text' as const, text: `Cascade ${cascadeId} is stalled (aborted). Restore it with update_status before writing (AFR-20).` }] };
+      }
+    }
+
+    try {
+      const result = await handler(args);
+      logAction(name, 'ok', { cascadeId });
+      return result;
+    } catch (err: any) {
+      logAction(name, 'error', { cascadeId, detail: err?.message });
+      throw err;
+    }
+  };
+}
+
+function regTool(name: string, description: string, schema: any, handler: (args: any) => Promise<any>) {
+  return mcpTool(name, description, schema, guard(name, handler));
+}
+
+// ============================================================
 // TOOL 1: store_plan — Save immutable research plan
 // ============================================================
-server.tool(
+regTool(
   'store_plan',
   'Save an immutable research plan for a cascade. Locks questions and criteria at round start to prevent HARKing.',
   {
@@ -75,7 +126,7 @@ server.tool(
 // ============================================================
 // TOOL 2: store_finding — Ingest finding with trust scoring
 // ============================================================
-server.tool(
+regTool(
   'store_finding',
   'Store a research finding. Generates content-addressable ID. Trust scoring applied automatically.',
   {
@@ -107,7 +158,7 @@ server.tool(
 // ============================================================
 // TOOL 3: get_findings — Query findings (FTS + filters)
 // ============================================================
-server.tool(
+regTool(
   'get_findings',
   'Query stored findings using full-text search and/or filters.',
   {
@@ -139,6 +190,7 @@ server.tool(
     if (cascade_id) { sql += ' AND cascade_id = ?'; params.push(cascade_id); }
     if (min_confidence !== undefined) { sql += ' AND confidence >= ?'; params.push(min_confidence); }
     if (!include_quarantined) { sql += ' AND quarantined = 0'; }
+    sql += ' AND rejected = 0'; // tombstoned findings never surface in retrieval (AFR-12)
     if (round !== undefined) { sql += ' AND cascade_round = ?'; params.push(round); }
 
     sql += ' ORDER BY confidence DESC LIMIT ?';
@@ -160,7 +212,7 @@ server.tool(
 // ============================================================
 // TOOL 4: add_entity — Add KG entity
 // ============================================================
-server.tool(
+regTool(
   'add_entity',
   'Add an entity to the knowledge graph. Upserts on (name, entity_type).',
   {
@@ -194,7 +246,7 @@ server.tool(
 // ============================================================
 // TOOL 5: add_link — Add KG edge
 // ============================================================
-server.tool(
+regTool(
   'add_link',
   'Add a directional link between two knowledge graph entities.',
   {
@@ -234,7 +286,7 @@ server.tool(
 // ============================================================
 // TOOL 6: query_graph — Recursive CTE traversal (≤3 hops)
 // ============================================================
-server.tool(
+regTool(
   'query_graph',
   'Traverse the knowledge graph from a starting entity. Uses recursive CTE, bounded to 3 hops max. Follows edges in both directions by default.',
   {
@@ -329,7 +381,7 @@ server.tool(
 // ============================================================
 // TOOL 7: store_hypothesis — Add/update hypothesis
 // ============================================================
-server.tool(
+regTool(
   'store_hypothesis',
   'Store or update a research hypothesis in the cascade.',
   {
@@ -382,7 +434,7 @@ server.tool(
 // ============================================================
 // TOOL 8: get_hypotheses — Query hypothesis population
 // ============================================================
-server.tool(
+regTool(
   'get_hypotheses',
   'Query hypotheses for a cascade, optionally filtered by status.',
   {
@@ -410,7 +462,7 @@ server.tool(
 // ============================================================
 // TOOL 9: cascade_init — Initialize a new research cascade
 // ============================================================
-server.tool(
+regTool(
   'cascade_init',
   'Initialize a new research cascade with a question. Returns cascade ID.',
   {
@@ -435,7 +487,7 @@ server.tool(
 // ============================================================
 // TOOL 10: get_status — Cascade state + metrics
 // ============================================================
-server.tool(
+regTool(
   'get_status',
   'Get current cascade status including progress, findings count, hypothesis count, and PID state.',
   {
@@ -455,12 +507,18 @@ server.tool(
       const entityCount = (db.prepare('SELECT COUNT(*) as n FROM kg_entities').get() as any).n;
       const edgeCount = (db.prepare('SELECT COUNT(*) as n FROM kg_edges').get() as any).n;
 
-      // Auto-apply pending steer events
+      // Apply pending steer events — but only low-consequence ones auto-apply.
+      // High-consequence steers (redirect, reject, drop_hypothesis) are held
+      // until a human calls apply_steer (AFR-12 approval gate).
       const pendingSteers = db.prepare('SELECT * FROM steer_events WHERE cascade_id = ? AND applied = 0 ORDER BY created_at').all(cascade_id) as any[];
       const appliedSteers: string[] = [];
+      const awaitingApproval: string[] = [];
       for (const steer of pendingSteers) {
-        db.prepare('UPDATE steer_events SET applied = 1 WHERE id = ?').run(steer.id);
-        appliedSteers.push(`[${steer.event_type}] ${steer.instruction}`);
+        if (steerAutoApplies(steer.event_type)) {
+          appliedSteers.push(`[${steer.event_type}] ${applySteer(steer.id)}`);
+        } else {
+          awaitingApproval.push(`steer #${steer.id} [${steer.event_type}] "${steer.instruction}" — call apply_steer to approve`);
+        }
       }
 
       // --- Phase 7 activation: check interventions ---
@@ -477,6 +535,7 @@ server.tool(
         plan: cascade.plan_json ? JSON.parse(cascade.plan_json) : null,
         counts: { findings: findingsCount, quarantined: quarantinedCount, hypotheses: hypothesesCount, threads: threadsCount, entities: entityCount, edges: edgeCount, notes: noteCount },
         applied_steers: appliedSteers.length > 0 ? appliedSteers : undefined,
+        awaiting_approval: awaitingApproval.length > 0 ? awaitingApproval : undefined,
         interventions: blockingInterventions.length > 0
           ? { blocking: blockingInterventions.map(i => i.description), advisory: advisoryInterventions.map(i => i.description) }
           : advisoryInterventions.length > 0
@@ -497,7 +556,7 @@ server.tool(
 // ============================================================
 // TOOL 11: update_status — Advance phase/round
 // ============================================================
-server.tool(
+regTool(
   'update_status',
   'Update cascade status and/or advance to next round.',
   {
@@ -577,7 +636,7 @@ server.tool(
 // ============================================================
 // TOOL 12: get_metrics — Information-theoretic dashboard
 // ============================================================
-server.tool(
+regTool(
   'get_metrics',
   'Get cascade quality metrics: coverage, depth, confidence distribution, source diversity.',
   {
@@ -678,7 +737,7 @@ server.tool(
 // ============================================================
 // TOOL 13: store_checkpoint — Step-level checkpointing
 // ============================================================
-server.tool(
+regTool(
   'store_checkpoint',
   'Save a checkpoint for crash recovery. Each step is checkpointed independently.',
   {
@@ -712,7 +771,7 @@ server.tool(
 // ============================================================
 // TOOL 14: steer — Submit human steering event
 // ============================================================
-server.tool(
+regTool(
   'steer',
   'Submit a steering event to redirect an active cascade.',
   {
@@ -736,7 +795,7 @@ server.tool(
 // ============================================================
 // TOOL 15: record_metric — Store a metric value
 // ============================================================
-server.tool(
+regTool(
   'record_metric',
   'Record a metric value for tracking cascade health over time.',
   {
@@ -759,7 +818,7 @@ server.tool(
 // ============================================================
 // TOOL 16: create_note — A-MEM atomic note creation
 // ============================================================
-server.tool(
+regTool(
   'create_note',
   'Create an atomic Zettelkasten note from an insight. Auto-links to related notes by keyword overlap. Content-addressable (idempotent).',
   {
@@ -780,7 +839,7 @@ server.tool(
         .all(noteId, cascade_id) as any[];
 
       let linksCreated = 0;
-      const contentWords = new Set(content.toLowerCase().split(/\s+/).filter(w => w.length > 5));
+      const contentWords = new Set<string>(String(content).toLowerCase().split(/\s+/).filter((w: string) => w.length > 5));
       for (const other of existing) {
         const otherWords = new Set(other.content.toLowerCase().split(/\s+/).filter((w: string) => w.length > 5));
         let overlap = 0;
@@ -805,7 +864,7 @@ server.tool(
 // ============================================================
 // TOOL 17: search_notes — Search Zettelkasten notes
 // ============================================================
-server.tool(
+regTool(
   'search_notes',
   'Search atomic notes by keyword. Returns notes sorted by access frequency.',
   {
@@ -815,6 +874,42 @@ server.tool(
   async ({ keyword, limit }) => {
     const notes = searchNotes(keyword, limit);
     return { content: [{ type: 'text' as const, text: JSON.stringify(notes, null, 2) }] };
+  }
+);
+
+// ============================================================
+// TOOL 18: apply_steer — Human approval gate for high-consequence steers
+// ============================================================
+regTool(
+  'apply_steer',
+  'Approve and enact a queued high-consequence steer (redirect, reject, drop_hypothesis). These are NOT auto-applied — this tool is the human-in-the-loop gate. Low-consequence steers (narrow, broaden, add_question, approve) apply automatically on get_status.',
+  {
+    steer_id: z.number().describe('The id of the pending steer event to approve and apply'),
+  },
+  async ({ steer_id }) => {
+    const db = getDb();
+    const event = db.prepare('SELECT * FROM steer_events WHERE id = ?').get(steer_id) as any;
+    if (!event) return { content: [{ type: 'text' as const, text: `Steer #${steer_id} not found.` }] };
+    if (event.applied) return { content: [{ type: 'text' as const, text: `Steer #${steer_id} was already applied.` }] };
+
+    const outcome = applySteer(steer_id);
+    return { content: [{ type: 'text' as const, text: `Approved and applied steer #${steer_id}: ${outcome}` }] };
+  }
+);
+
+// ============================================================
+// TOOL 19: get_actions — Replayable action audit log
+// ============================================================
+regTool(
+  'get_actions',
+  'Return the recent tool-action audit log (AFR-16): which tool ran, its consequence tier, the cascade, and whether it succeeded / was blocked / errored. The replayable record of engine behaviour.',
+  {
+    cascade_id: z.string().max(MAX_ID).optional(),
+    limit: z.number().min(1).max(200).optional().default(50),
+  },
+  async ({ cascade_id, limit }) => {
+    const actions = getRecentActions(limit, cascade_id);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(actions, null, 2) }] };
   }
 );
 

@@ -25,7 +25,7 @@ Add to your `.mcp.json` (Claude Code) or equivalent MCP config:
 }
 ```
 
-Start a Claude Code session and all 17 tools are available.
+Start a Claude Code session and all 19 tools are available.
 
 ### Option B: From source
 
@@ -33,7 +33,7 @@ Start a Claude Code session and all 17 tools are available.
 git clone https://github.com/geoff-obsidicore/Research-Cascade.git
 cd Research-Cascade/servers/cascade-engine
 npm install && npm run build
-npm test  # 78 tests, all passing
+npm test  # 95 tests, all passing
 ```
 
 The `.mcp.json` in the project root auto-registers the server for development.
@@ -55,9 +55,24 @@ cascade-engine status         # Show active cascades
 cascade-engine status <id>    # Detailed cascade status
 cascade-engine graph          # Knowledge graph stats
 cascade-engine notes          # Zettelkasten note stats
+cascade-engine actions [id]   # Tool-action audit log (AFR-16)
+cascade-engine halt [reason]  # Kill-switch — refuse all tool calls (AFR-20)
+cascade-engine resume         # Release the kill-switch
+cascade-engine abort <id>     # Stall one cascade (refuse further writes)
 cascade-engine db-path        # Print database location
 cascade-engine reset          # Delete database, start fresh
 ```
+
+## Security & operational safety
+
+Research-Cascade is a local-first, stdio MCP server with a small blast radius:
+its tools only read/write a local SQLite knowledge base — no shell, no network
+egress, no credentials, no spend. It ships a kill-switch, a human approval gate
+for destructive actions, reversible tombstones, a replayable action log, and
+real-time anomaly interventions. See **[SECURITY.md](SECURITY.md)**, the
+**[agent registry](docs/agent-registry.md)**, and the
+**[incident runbook](docs/incident-runbook.md)**. Maintainer: Geoff "Lava"
+Lavagnino (geoff@obsidicore.com).
 
 The knowledge graph persists in `~/.cascade-engine/knowledge.db` — it survives context compaction, session restarts, and `/clear`.
 
