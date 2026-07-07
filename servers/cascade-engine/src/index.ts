@@ -786,8 +786,11 @@ regTool(
     db.prepare('INSERT INTO steer_events (cascade_id, event_type, instruction, target_id) VALUES (?, ?, ?, ?)')
       .run(cascade_id, event_type, instruction, target_id);
 
+    const followUp = steerAutoApplies(event_type)
+      ? 'Low-consequence: applies automatically on the next get_status.'
+      : 'High-consequence: held for human approval via apply_steer (AFR-12).';
     return {
-      content: [{ type: 'text' as const, text: `Steer event queued: ${event_type} — "${instruction}". Will be applied on next cascade iteration.` }],
+      content: [{ type: 'text' as const, text: `Steer event queued: ${event_type} — "${instruction}". ${followUp}` }],
     };
   }
 );

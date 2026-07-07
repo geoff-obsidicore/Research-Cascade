@@ -1,6 +1,14 @@
 # Research Cascade — Master Specification
 > Version 1.0 | March 15, 2026 | Distilled from 11-prompt research cascade across Claude + Gemini
 
+> **Implementation status (2026-07):** This is the original *design* spec and is
+> aspirational in places. For what is actually shipped — including the
+> operational-safety controls — see `CHANGELOG.md`, `SECURITY.md`, and `docs/`.
+> Notably, the "Cockatiel" resilience stack / circuit breaker described below is
+> **not implemented**; real-time anomaly handling ships as the `budget_overrun`
+> and `quarantine_spike` interventions surfaced on `get_status`, and the
+> exec-approval hook is realized as the `apply_steer` human approval gate.
+
 ## Purpose
 This document is the durable synthesis of all research findings. It survives context clears and serves as the authoritative reference for implementation. Read this before writing any code.
 
