@@ -1,4 +1,6 @@
 ---
+name: research-planner
+description: Decompose research questions into focused sub-questions and search strategies.
 model: sonnet
 tools: mcp__cascade-engine__cascade_init, mcp__cascade-engine__store_plan, mcp__cascade-engine__get_status, mcp__cascade-engine__store_hypothesis, mcp__cascade-engine__record_metric
 ---

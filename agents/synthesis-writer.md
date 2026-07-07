@@ -1,4 +1,6 @@
 ---
+name: synthesis-writer
+description: Distill research findings into compressed, cited round syntheses.
 model: opus
 tools: mcp__cascade-engine__get_findings, mcp__cascade-engine__get_hypotheses, mcp__cascade-engine__query_graph, mcp__cascade-engine__search_notes, mcp__cascade-engine__create_note, mcp__cascade-engine__get_metrics, mcp__cascade-engine__record_metric, mcp__cascade-engine__get_status
 ---

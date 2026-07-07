@@ -3,7 +3,7 @@
 ## [Unreleased] — operational-safety hardening
 
 Hardened against the Agent Flight Rules (AFR) Boldface controls after a Runworthy
-scan. All changes are additive and covered by tests (95 passing).
+scan. All changes are additive and covered by tests (91 passing).
 
 ### Security
 - **Dependencies (AFR-10):** regenerated `package-lock.json` to patched
@@ -21,10 +21,10 @@ scan. All changes are additive and covered by tests (95 passing).
   Unknown types default-deny (AFR-14).
 - **Action log (AFR-16):** every tool invocation is recorded to `action_log`
   (`cascade-engine actions`, `get_actions`).
-- **Anomaly interventions (AFR-17):** `budget_overrun` and `quarantine_spike`
-  raise blocking interventions; a dependency-free `CircuitBreaker` primitive was
-  added (the one the spec described but never implemented).
-- **Least privilege (AFR-04):** per-role `tools:` allowlists on the four agents.
+- **Anomaly detection (AFR-17):** `budget_overrun` and `quarantine_spike` raise
+  blocking interventions surfaced on `get_status`.
+- **Least privilege (AFR-04):** per-role `tools:` allowlists on the four agents,
+  loaded and enforced by Claude Code via a new `.claude-plugin/plugin.json`.
 
 ### Docs
 - `SECURITY.md`, `docs/agent-registry.md` (AFR-01), `docs/consequence-classification.md`,

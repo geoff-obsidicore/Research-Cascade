@@ -8,6 +8,7 @@
  */
 
 import { getDb } from '../db/index.js';
+import { steerAutoApplies } from '../safety/policy.js';
 
 export type SteerType = 'redirect' | 'narrow' | 'broaden' | 'add_question' | 'drop_hypothesis' | 'approve' | 'reject';
 
@@ -133,12 +134,23 @@ export function applySteer(eventId: number): string {
 }
 
 /**
- * Apply all pending steer events for a cascade.
- * Called at the start of each cascade iteration.
+ * Apply all pending LOW-consequence steer events for a cascade. High-consequence
+ * steers (redirect, reject, drop_hypothesis) are skipped here — they require
+ * explicit human approval via the apply_steer tool (AFR-12). This mirrors the
+ * gate in get_status, so no code path can auto-enact a destructive steer. Not
+ * wired into the live request path today; kept for tests and a future sweep.
  */
 export function applyAllPendingSteers(cascadeId: string): string[] {
   const pending = getPendingSteers(cascadeId);
-  return pending.map(event => applySteer(event.id));
+  const results: string[] = [];
+  for (const event of pending) {
+    if (steerAutoApplies(event.eventType)) {
+      results.push(applySteer(event.id));
+    } else {
+      results.push(`Held ${event.eventType} steer #${event.id} — needs human approval via apply_steer`);
+    }
+  }
+  return results;
 }
 
 // --- Helpers ---

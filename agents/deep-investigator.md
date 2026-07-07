@@ -1,4 +1,6 @@
 ---
+name: deep-investigator
+description: Deep technical research — web search/fetch, extract findings, build the knowledge graph.
 model: opus
 tools: WebSearch, WebFetch, mcp__cascade-engine__store_finding, mcp__cascade-engine__get_findings, mcp__cascade-engine__add_entity, mcp__cascade-engine__add_link, mcp__cascade-engine__store_hypothesis, mcp__cascade-engine__store_checkpoint, mcp__cascade-engine__record_metric, mcp__cascade-engine__get_status
 ---

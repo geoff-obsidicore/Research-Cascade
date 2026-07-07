@@ -1,0 +1,14 @@
+{
+  "name": "research-cascade",
+  "version": "0.2.1",
+  "description": "Progressive deep-research agents (planner, investigator, validator, synthesizer) plus the cascade-engine MCP server. Installing this plugin registers the four subagents with enforced per-role tool allowlists (AFR-04) and the cascade-engine MCP server.",
+  "author": {
+    "name": "Geoff \"Lava\" Lavagnino",
+    "email": "geoff@obsidicore.com",
+    "url": "https://github.com/geofflava"
+  },
+  "homepage": "https://github.com/geofflava/Research-Cascade",
+  "repository": "https://github.com/geofflava/Research-Cascade",
+  "license": "MIT",
+  "keywords": ["research", "mcp", "knowledge-graph", "agents", "trust-scoring"]
+}

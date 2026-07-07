@@ -41,11 +41,11 @@ codebase; use a per-project, revocable model key at the host.
 
 | Control | Where |
 |---|---|
-| AFR-04 Minimum scope — per-role tool allowlists | `agents/*.md` frontmatter, `docs/agent-registry.md` |
+| AFR-04 Minimum scope — per-role tool allowlists (enforced by Claude Code when this repo is installed as a plugin) | `agents/*.md` frontmatter, `.claude-plugin/plugin.json`, `docs/agent-registry.md` |
 | AFR-11 Consequence classification (enforced) | `src/safety/policy.ts`, `docs/consequence-classification.md` |
 | AFR-12 Approval gate on high-consequence steers; reversible tombstones | `src/index.ts` (`get_status`, `apply_steer`), `src/hitl/steering.ts` |
 | AFR-16 Action log (replayable) | `src/safety/audit.ts`, `cascade-engine actions` |
-| AFR-17 Real-time anomaly interventions (budget/quarantine) + circuit breaker | `src/hitl/interventions.ts`, `src/control/circuit-breaker.ts` |
+| AFR-17 Real-time anomaly detection — budget-overrun & quarantine-spike interventions surfaced on `get_status` | `src/hitl/interventions.ts` |
 | AFR-20 Kill-switch + per-cascade abort | `src/safety/killswitch.ts`, `cascade-engine halt/resume/abort` |
 | AFR-09 Dependency vetting & pinning | `docs/dependency-policy.md` |
 | AFR-25 Incident runbook | `docs/incident-runbook.md` |

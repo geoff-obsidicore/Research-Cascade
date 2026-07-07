@@ -14,11 +14,13 @@ Every agent that runs as part of Research-Cascade, with a single named owner.
 
 ## Notes
 
-- **Least privilege (AFR-04):** the allowlists above are enforced by the `tools:`
-  frontmatter in each `agents/*.md` file (Claude Code honors these). Only the two
-  investigative roles get web access; only `cross-validator` can *queue* a steer,
-  and no subagent can *approve* a high-consequence steer — that is a human action
-  via `apply_steer` (AFR-12).
+- **Least privilege (AFR-04):** the allowlists above are declared in the `tools:`
+  frontmatter of each `agents/*.md` file. Claude Code enforces them when this repo
+  is installed as a plugin — `.claude-plugin/plugin.json` makes it a plugin, and
+  plugin subagents get *only* their listed tools. Only the two investigative roles
+  get web access; only `cross-validator` can *queue* a steer, and no subagent can
+  *approve* a high-consequence steer — that is a human action via `apply_steer`
+  (AFR-12).
 - The tool names assume the engine is mounted under the MCP alias `cascade-engine`
   (see `.mcp.json`). Under a different host/alias, adjust the `mcp__<alias>__*`
   names accordingly.

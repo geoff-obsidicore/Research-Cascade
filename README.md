@@ -33,7 +33,7 @@ Start a Claude Code session and all 19 tools are available.
 git clone https://github.com/geoff-obsidicore/Research-Cascade.git
 cd Research-Cascade/servers/cascade-engine
 npm install && npm run build
-npm test  # 95 tests, all passing
+npm test  # 91 tests, all passing
 ```
 
 The `.mcp.json` in the project root auto-registers the server for development.
