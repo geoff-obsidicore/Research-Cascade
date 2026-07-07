@@ -13,9 +13,10 @@ Dev-only: `typescript`, `vitest`, `@types/*` — build and test, never shipped
 
 ## Pinning
 
-- Runtime dependencies are **pinned to exact versions** in `package.json` (no
-  caret ranges), and the full tree is locked in `package-lock.json` (committed).
-  Installs are reproducible.
+- **All dependencies — runtime and dev — are pinned to exact versions** in
+  `package.json` (no caret ranges), and the full tree is locked in
+  `package-lock.json` (committed). Installs are reproducible, and a manifest-level
+  scanner sees no range that admits a vulnerable version.
 - The MCP server registered in `.mcp.json` runs the **local built** engine
   (`servers/cascade-engine/dist/index.js`) — no third-party MCP servers are
   connected, so there is no external server to vet.
