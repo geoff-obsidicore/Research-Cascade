@@ -30,7 +30,7 @@ Start a Claude Code session and all 19 tools are available.
 ### Option B: From source
 
 ```bash
-git clone https://github.com/geoff-obsidicore/Research-Cascade.git
+git clone https://github.com/geofflava/Research-Cascade.git
 cd Research-Cascade/servers/cascade-engine
 npm install && npm run build
 npm test  # 91 tests, all passing

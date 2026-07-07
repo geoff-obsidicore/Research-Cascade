@@ -225,7 +225,7 @@ Environment:
   CASCADE_DB_PATH   Override database location
                     Default: ~/.cascade-engine/knowledge.db
 
-More info: https://github.com/geoff-obsidicore/Research-Cascade`);
+More info: https://github.com/geofflava/Research-Cascade`);
       break;
     }
 
